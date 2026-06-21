@@ -720,8 +720,13 @@ HRESULT get_code_page(xml_encoding encoding, UINT *cp)
 {
     if (encoding == XmlEncoding_Unknown)
     {
-        FIXME("unsupported encoding %d\n", encoding);
-        return E_NOTIMPL;
+        /* No BOM and no/unrecognized encoding declaration: per the XML spec the
+           document is UTF-8. Wine ignores the MultiLanguage/MLang property that
+           some callers (e.g. IIS nativrd2 parsing applicationhost.config) rely on
+           for detection, so we'd otherwise leave encoding Unknown and fail here. */
+        WARN("unknown encoding, defaulting to UTF-8\n");
+        *cp = CP_UTF8;
+        return S_OK;
     }
 
     *cp = xml_encoding_map[encoding].cp;
