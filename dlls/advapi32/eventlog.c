@@ -644,6 +644,7 @@ BOOL WINAPI ReportEventW( HANDLE hEventLog, WORD wType, WORD wCategory, DWORD dw
     for (i = 0; i < wNumStrings; i++)
     {
         const WCHAR *line = lpStrings[i];
+        if (!line) continue;  /* native tolerates NULL entries in lpStrings; Wine crashed in while(*line) */
 
         while (*line)
         {
