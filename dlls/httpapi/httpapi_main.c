@@ -377,6 +377,86 @@ static void format_date(char *buffer)
             date.wYear, date.wHour, date.wMinute, date.wSecond);
 }
 
+/* Read a file-handle entity chunk into a freshly allocated buffer. */
+static BOOL read_file_chunk(const HTTP_DATA_CHUNK *chunk, char **out, ULONG *out_len)
+{
+    HANDLE fh = chunk->FromFileHandle.FileHandle;
+    ULONGLONG start = chunk->FromFileHandle.ByteRange.StartingOffset.QuadPart;
+    ULONGLONG want = chunk->FromFileHandle.ByteRange.Length.QuadPart;
+    LARGE_INTEGER size;
+    ULONGLONG done = 0;
+    HANDLE event;
+    char *buf;
+    BOOL ok = TRUE;
+
+    *out = NULL;
+    *out_len = 0;
+    if (!GetFileSizeEx(fh, &size))
+        return FALSE;
+    if (want == ~(ULONGLONG)0 || start + want > (ULONGLONG)size.QuadPart)
+    {
+        if (start > (ULONGLONG)size.QuadPart)
+            return FALSE;
+        want = (ULONGLONG)size.QuadPart - start;
+    }
+    if (!(buf = malloc(want ? want : 1)))
+        return FALSE;
+    if (!want)
+    {
+        *out = buf;
+        return TRUE;
+    }
+    if (!(event = CreateEventW(NULL, TRUE, FALSE, NULL)))
+    {
+        free(buf);
+        return FALSE;
+    }
+    while (done < want && ok)
+    {
+        OVERLAPPED ovl = {0};
+        ULONGLONG pos = start + done;
+        DWORD nread = 0, req = (want - done > 0x40000000) ? 0x40000000 : (DWORD)(want - done);
+
+        ovl.Offset = (DWORD)pos;
+        ovl.OffsetHigh = (DWORD)(pos >> 32);
+        ovl.hEvent = event;
+        if (!ReadFile(fh, buf + done, req, &nread, &ovl))
+        {
+            if (GetLastError() != ERROR_IO_PENDING || !GetOverlappedResult(fh, &ovl, &nread, TRUE))
+                ok = FALSE;
+        }
+        if (ok && !nread)
+            ok = FALSE;
+        done += nread;
+    }
+    CloseHandle(event);
+    if (!ok)
+    {
+        free(buf);
+        return FALSE;
+    }
+    *out = buf;
+    *out_len = (ULONG)want;
+    return TRUE;
+}
+
+/* Free buffers allocated for file-handle chunks plus the bookkeeping arrays. */
+static void free_chunk_data(const HTTP_RESPONSE *response, char **chunk_data, ULONG *chunk_size)
+{
+    USHORT i;
+
+    if (chunk_data)
+    {
+        for (i = 0; i < response->s.EntityChunkCount; ++i)
+        {
+            if (response->s.pEntityChunks[i].DataChunkType == HttpDataChunkFromFileHandle)
+                free(chunk_data[i]);
+        }
+    }
+    free(chunk_data);
+    free(chunk_size);
+}
+
 /***********************************************************************
  *        HttpSendHttpResponse     (HTTPAPI.@)
  */
@@ -423,6 +503,8 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
     ULONG ret = ERROR_SUCCESS;
     int len, body_len = 0;
     char *p, dummy[12];
+    char **chunk_data = NULL;
+    ULONG *chunk_size = NULL;
     USHORT i;
 
     TRACE("queue %p, id %s, flags %#lx, response %p, cache_policy %p, "
@@ -440,14 +522,39 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
         WARN("Ignoring log_data.\n");
 
     len = 12 + sprintf(dummy, "%hu", response->s.StatusCode) + response->s.ReasonLength;
+    if (response->s.EntityChunkCount &&
+        (!(chunk_data = calloc(response->s.EntityChunkCount, sizeof(*chunk_data))) ||
+         !(chunk_size = calloc(response->s.EntityChunkCount, sizeof(*chunk_size)))))
+    {
+        free(chunk_data);
+        free(chunk_size);
+        return ERROR_OUTOFMEMORY;
+    }
     for (i = 0; i < response->s.EntityChunkCount; ++i)
     {
-        if (response->s.pEntityChunks[i].DataChunkType != HttpDataChunkFromMemory)
+        const HTTP_DATA_CHUNK *chunk = &response->s.pEntityChunks[i];
+
+        if (chunk->DataChunkType == HttpDataChunkFromMemory)
         {
-            FIXME("Unhandled data chunk type %u.\n", response->s.pEntityChunks[i].DataChunkType);
+            chunk_data[i] = chunk->FromMemory.pBuffer;
+            chunk_size[i] = chunk->FromMemory.BufferLength;
+        }
+        else if (chunk->DataChunkType == HttpDataChunkFromFileHandle)
+        {
+            if (!read_file_chunk(chunk, &chunk_data[i], &chunk_size[i]))
+            {
+                ERR("Failed to read file-handle chunk.\n");
+                free_chunk_data(response, chunk_data, chunk_size);
+                return ERROR_INVALID_PARAMETER;
+            }
+        }
+        else
+        {
+            FIXME("Unhandled data chunk type %u.\n", chunk->DataChunkType);
+            free_chunk_data(response, chunk_data, chunk_size);
             return ERROR_CALL_NOT_IMPLEMENTED;
         }
-        body_len += response->s.pEntityChunks[i].FromMemory.BufferLength;
+        body_len += chunk_size[i];
     }
     len += body_len;
     for (i = 0; i < HttpHeaderResponseMaximum; ++i)
@@ -470,7 +577,10 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
     len += 2;
 
     if (!(buffer = malloc(offsetof(struct http_response, buffer[len]))))
+    {
+        free_chunk_data(response, chunk_data, chunk_size);
         return ERROR_OUTOFMEMORY;
+    }
     buffer->id = id;
     buffer->response_flags = flags;
     buffer->len = len;
@@ -500,9 +610,8 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
     p += 2;
     for (i = 0; i < response->s.EntityChunkCount; ++i)
     {
-        const HTTP_DATA_CHUNK *chunk = &response->s.pEntityChunks[i];
-        memcpy(p, chunk->FromMemory.pBuffer, chunk->FromMemory.BufferLength);
-        p += chunk->FromMemory.BufferLength;
+        memcpy(p, chunk_data[i], chunk_size[i]);
+        p += chunk_size[i];
     }
 
     if (!ovl)
@@ -513,6 +622,7 @@ ULONG WINAPI HttpSendHttpResponse(HANDLE queue, HTTP_REQUEST_ID id, ULONG flags,
         ret = GetLastError();
 
     free(buffer);
+    free_chunk_data(response, chunk_data, chunk_size);
     return ret;
 }
 
@@ -759,8 +869,8 @@ ULONG WINAPI HttpSetUrlGroupProperty(HTTP_URL_GROUP_ID id, HTTP_SERVER_PROPERTY 
             WARN("Ignoring logging property.\n");
             return ERROR_SUCCESS;
         default:
-            FIXME("Unhandled property %u.\n", property);
-            return ERROR_CALL_NOT_IMPLEMENTED;
+            FIXME("Ignoring unhandled property %u.\n", property);
+            return ERROR_SUCCESS;
     }
 }
 
@@ -829,13 +939,12 @@ ULONG WINAPI HttpCreateRequestQueue(HTTPAPI_VERSION version, const WCHAR *name,
     OBJECT_ATTRIBUTES attr = {sizeof(attr)};
     UNICODE_STRING string = RTL_CONSTANT_STRING(L"\\Device\\Http\\ReqQueue");
     IO_STATUS_BLOCK iosb;
+    NTSTATUS ret;
 
     TRACE("version %u.%u, name %s, sa %p, flags %#lx, handle %p.\n",
             version.HttpApiMajorVersion, version.HttpApiMinorVersion,
             debugstr_w(name), sa, flags, handle);
 
-    if (name)
-        FIXME("Unhandled name %s.\n", debugstr_w(name));
     if (flags)
         FIXME("Unhandled flags %#lx.\n", flags);
 
@@ -843,8 +952,21 @@ ULONG WINAPI HttpCreateRequestQueue(HTTPAPI_VERSION version, const WCHAR *name,
     if (sa && sa->bInheritHandle)
         attr.Attributes |= OBJ_INHERIT;
     attr.SecurityDescriptor = sa ? sa->lpSecurityDescriptor : NULL;
-    return RtlNtStatusToDosError(NtCreateFile(handle, SYNCHRONIZE, &attr, &iosb, NULL,
-            FILE_ATTRIBUTE_NORMAL, 0, FILE_OPEN, FILE_NON_DIRECTORY_FILE, NULL, 0));
+    ret = NtCreateFile(handle, SYNCHRONIZE, &attr, &iosb, NULL,
+            FILE_ATTRIBUTE_NORMAL, 0, FILE_OPEN, FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (ret)
+        return RtlNtStatusToDosError(ret);
+
+    /* Associate the shared queue name so controller/worker opens of the same
+     * name resolve to one queue object in the driver. */
+    if (name && name[0])
+    {
+        DWORD ret_len;
+        if (!DeviceIoControl(*handle, IOCTL_HTTP_NAME_QUEUE, (void *)name,
+                (wcslen(name) + 1) * sizeof(WCHAR), NULL, 0, &ret_len, NULL))
+            WARN("Failed to name request queue, error %lu.\n", GetLastError());
+    }
+    return NO_ERROR;
 }
 
 /***********************************************************************
@@ -864,9 +986,24 @@ ULONG WINAPI HttpCloseRequestQueue(HANDLE handle)
 ULONG WINAPI HttpSetRequestQueueProperty(HANDLE queue, HTTP_SERVER_PROPERTY property,
         void *value, ULONG length, ULONG reserved1, void *reserved2)
 {
-    FIXME("queue %p, property %u, value %p, length %lu, reserved1 %#lx, reserved2 %p, stub!\n",
+    FIXME("queue %p, property %u, value %p, length %lu, reserved1 %#lx, reserved2 %p, ignoring.\n",
             queue, property, value, length, reserved1, reserved2);
-    return ERROR_CALL_NOT_IMPLEMENTED;
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+ *        HttpShutdownRequestQueue     (HTTPAPI.@)
+ */
+ULONG WINAPI HttpShutdownRequestQueue(HANDLE queue)
+{
+    IO_STATUS_BLOCK iosb;
+
+    TRACE("queue %p.\n", queue);
+
+    /* Best effort: cancel pending I/O so blocked receives unblock. Wine's
+     * http.sys does not need an explicit graceful-drain step. */
+    NtCancelIoFile(queue, &iosb);
+    return ERROR_SUCCESS;
 }
 
 /***********************************************************************
@@ -887,7 +1024,7 @@ ULONG WINAPI HttpSetServerSessionProperty(HTTP_SERVER_SESSION_ID id,
             return ERROR_SUCCESS;
         }
         default:
-            FIXME("Unhandled property %u.\n", property);
-            return ERROR_CALL_NOT_IMPLEMENTED;
+            FIXME("Ignoring unhandled property %u.\n", property);
+            return ERROR_SUCCESS;
     }
 }

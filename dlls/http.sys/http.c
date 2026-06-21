@@ -106,6 +106,8 @@ struct request_queue
     struct list entry;
     LIST_ENTRY irp_queue;
     struct list urls;
+    WCHAR *name;       /* shared-queue name, or NULL for an anonymous queue */
+    LONG refcount;     /* number of open handles referencing this queue */
 };
 
 static struct list request_queues = LIST_INIT(request_queues);
@@ -1081,6 +1083,8 @@ static NTSTATUS http_receive_body(struct request_queue *queue, IRP *irp)
     return ret;
 }
 
+static NTSTATUS http_name_queue(struct request_queue *queue, IRP *irp);
+
 static NTSTATUS WINAPI dispatch_ioctl(DEVICE_OBJECT *device, IRP *irp)
 {
     IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
@@ -1104,6 +1108,9 @@ static NTSTATUS WINAPI dispatch_ioctl(DEVICE_OBJECT *device, IRP *irp)
     case IOCTL_HTTP_RECEIVE_BODY:
         ret = http_receive_body(queue, irp);
         break;
+    case IOCTL_HTTP_NAME_QUEUE:
+        ret = http_name_queue(queue, irp);
+        break;
     default:
         FIXME("Unhandled ioctl %#lx.\n", stack->Parameters.DeviceIoControl.IoControlCode);
         ret = STATUS_NOT_IMPLEMENTED;
@@ -1125,6 +1132,7 @@ static NTSTATUS WINAPI dispatch_create(DEVICE_OBJECT *device, IRP *irp)
     if (!(queue = calloc(1, sizeof(*queue))))
         return STATUS_NO_MEMORY;
     list_init(&queue->urls);
+    queue->refcount = 1;
     stack->FileObject->FsContext = queue;
     InitializeListHead(&queue->irp_queue);
 
@@ -1136,6 +1144,68 @@ static NTSTATUS WINAPI dispatch_create(DEVICE_OBJECT *device, IRP *irp)
 
     irp->IoStatus.Status = STATUS_SUCCESS;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+/* Compare a stored queue name against the first @len chars of @name. */
+static BOOL queue_name_equals(const WCHAR *stored, const WCHAR *name, SIZE_T len)
+{
+    SIZE_T i;
+    if (!stored) return FALSE;
+    for (i = 0; i < len; i++) if (stored[i] != name[i]) return FALSE;
+    return !stored[len];
+}
+
+/* IOCTL_HTTP_NAME_QUEUE: associate a shared name with this queue. If another
+ * queue already owns the name, merge this (freshly created, still empty) queue
+ * into it so a URL registered via one handle is serviced via the other. This
+ * implements the controller/worker shared-queue model used by IIS app pools. */
+static NTSTATUS http_name_queue(struct request_queue *queue, IRP *irp)
+{
+    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+    const WCHAR *name = irp->AssociatedIrp.SystemBuffer;
+    ULONG bytes = stack->Parameters.DeviceIoControl.InputBufferLength;
+    struct request_queue *existing;
+    SIZE_T name_len, i;
+
+    if (!name || bytes < sizeof(WCHAR))
+        return STATUS_INVALID_PARAMETER;
+    name_len = bytes / sizeof(WCHAR);
+    while (name_len && !name[name_len - 1]) name_len--;   /* trim trailing NUL(s) */
+    if (!name_len)
+        return STATUS_INVALID_PARAMETER;
+
+    EnterCriticalSection(&http_cs);
+
+    if (queue->name)
+    {
+        LeaveCriticalSection(&http_cs);
+        return STATUS_SUCCESS;
+    }
+
+    LIST_FOR_EACH_ENTRY(existing, &request_queues, struct request_queue, entry)
+    {
+        if (existing != queue && queue_name_equals(existing->name, name, name_len))
+        {
+            existing->refcount++;
+            stack->FileObject->FsContext = existing;
+            list_remove(&queue->entry);
+            LeaveCriticalSection(&http_cs);
+            free(queue->name);
+            free(queue);
+            TRACE("Merged into existing named queue %p, refcount %ld.\n",
+                    existing, existing->refcount);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if ((queue->name = malloc((name_len + 1) * sizeof(WCHAR))))
+    {
+        for (i = 0; i < name_len; i++) queue->name[i] = name[i];
+        queue->name[name_len] = 0;
+    }
+    LeaveCriticalSection(&http_cs);
+    TRACE("Named queue %p as %s.\n", queue, debugstr_w(queue->name));
     return STATUS_SUCCESS;
 }
 
@@ -1161,6 +1231,7 @@ static void close_queue(struct request_queue *queue)
         free(listening_sock);
     }
 
+    free(queue->name);
     free(queue);
 
     LeaveCriticalSection(&http_cs);
@@ -1175,6 +1246,14 @@ static NTSTATUS WINAPI dispatch_close(DEVICE_OBJECT *device, IRP *irp)
     TRACE("Closing queue %p.\n", queue);
 
     EnterCriticalSection(&http_cs);
+
+    if (--queue->refcount > 0)
+    {
+        LeaveCriticalSection(&http_cs);
+        irp->IoStatus.Status = STATUS_SUCCESS;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+    }
 
     while ((entry = queue->irp_queue.Flink) != &queue->irp_queue)
     {

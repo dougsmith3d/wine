@@ -30,7 +30,7 @@
 @ stdcall HttpSetServerSessionProperty(int64 long ptr long)
 @ stdcall HttpSetServiceConfiguration(ptr long ptr long ptr)
 @ stdcall HttpSetUrlGroupProperty(int64 long ptr long)
-@ stub HttpShutdownRequestQueue
+@ stdcall HttpShutdownRequestQueue(ptr)
 @ stdcall HttpTerminate(long ptr)
 @ stub HttpWaitForDemandStart
 @ stub HttpWaitForDisconnect

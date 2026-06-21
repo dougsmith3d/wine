@@ -38,6 +38,7 @@
 #include "ntdll_misc.h"
 #include "wine/asm.h"
 #include "wine/exception.h"
+#include "winnls.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(resource);
@@ -251,6 +252,203 @@ done:
 }
 
 
+/* ===================== MUI satellite resource fallback =====================
+ * Many Microsoft modules (e.g. iisres.dll) keep only icons/bitmaps in the main
+ * image and split STRING / MESSAGETABLE / DIALOG resources into a
+ * <dir>\<lang>\<name>.mui satellite. Windows redirects FindResource/LoadString
+ * to the satellite transparently; Wine historically looked only in the main
+ * module, so LoadString returned 0 and left ERROR_RESOURCE_TYPE_NOT_FOUND in
+ * last-error. This implements the redirect at the LdrFindResource chokepoint. */
+
+static inline SIZE_T mui_strlenW( const WCHAR *s )
+{
+    const WCHAR *p = s;
+    while (*p) p++;
+    return p - s;
+}
+
+static RTL_CRITICAL_SECTION mui_cs;
+static RTL_CRITICAL_SECTION_DEBUG mui_cs_debug =
+{
+    0, 0, &mui_cs,
+    { &mui_cs_debug.ProcessLocksList, &mui_cs_debug.ProcessLocksList },
+    0, 0, { (DWORD_PTR)(__FILE__ ": mui_cs") }
+};
+static RTL_CRITICAL_SECTION mui_cs = { &mui_cs_debug, -1, 0, 0, 0, 0 };
+
+struct mui_satellite
+{
+    HMODULE     base;        /* original module */
+    HMODULE     sat;         /* mapped satellite base, NULL = probed/none */
+    const char *sat_start;
+    const char *sat_end;
+};
+static struct mui_satellite mui_cache[512];
+static unsigned int mui_cache_count;
+
+/* map <path> (a .mui PE) as an image section; return base and fill *map_size */
+static HMODULE map_one_satellite( const WCHAR *path, SIZE_T *map_size )
+{
+    UNICODE_STRING nt_name;
+    OBJECT_ATTRIBUTES attr;
+    IO_STATUS_BLOCK io;
+    HANDLE file, section;
+    NTSTATUS status;
+    void *base = NULL;
+    SIZE_T size = 0;
+
+    if (!RtlDosPathNameToNtPathName_U( path, &nt_name, NULL, NULL )) return NULL;
+    InitializeObjectAttributes( &attr, &nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+    status = NtOpenFile( &file, GENERIC_READ | SYNCHRONIZE, &attr, &io,
+                         FILE_SHARE_READ | FILE_SHARE_DELETE,
+                         FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE );
+    RtlFreeUnicodeString( &nt_name );
+    if (!NT_SUCCESS(status)) return NULL;
+    status = NtCreateSection( &section, SECTION_MAP_READ | SECTION_QUERY, NULL, NULL,
+                              PAGE_READONLY, SEC_IMAGE, file );
+    NtClose( file );
+    if (!NT_SUCCESS(status)) return NULL;
+    status = NtMapViewOfSection( section, NtCurrentProcess(), &base, 0, 0, NULL,
+                                 &size, ViewShare, 0, PAGE_READONLY );
+    NtClose( section );
+    if (!NT_SUCCESS(status)) return NULL;
+    *map_size = size;
+    return base;
+}
+
+/* derive <dir>\<lang>\<name>.mui for hmod, trying preferred UI langs then en-US/en */
+static HMODULE load_mui_satellite( HMODULE hmod, const char **sat_end )
+{
+    static const WCHAR enUS[] = {'e','n','-','U','S',0};
+    static const WCHAR en[]   = {'e','n',0};
+    static const WCHAR muiext[] = {'.','m','u','i',0};
+    LDR_DATA_TABLE_ENTRY *ldr = NULL;
+    WCHAR path[MAX_PATH * 2], langs[256];
+    const WCHAR *full, *q, *dir_end, *name, *lang;
+    ULONG num = 0, sz = ARRAY_SIZE(langs);
+    HMODULE sat = NULL;
+    SIZE_T map_size = 0, dir_len, name_len;
+    int phase;
+
+    if (LdrFindEntryForAddress( hmod, &ldr )) return NULL;
+    if (!ldr->FullDllName.Buffer || !ldr->FullDllName.Length) return NULL;
+    full = ldr->FullDllName.Buffer;
+
+    dir_end = NULL;
+    for (q = full; *q; q++) if (*q == '\\' || *q == '/') dir_end = q;
+    if (!dir_end) return NULL;
+    name = dir_end + 1;
+    dir_len = dir_end - full;
+    name_len = mui_strlenW( name );
+    if (dir_len + name_len + 32 > ARRAY_SIZE(path)) return NULL;
+
+    if (RtlGetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, &num, langs, &sz ))
+        langs[0] = langs[1] = 0;
+
+    for (phase = 0; !sat && phase < 3; phase++)
+    {
+        const WCHAR *list_p = (phase == 0) ? langs : (phase == 1) ? enUS : en;
+        for (lang = list_p; *lang; lang += (mui_strlenW(lang) + 1))
+        {
+            WCHAR *w = path;
+            const WCHAR *r;
+            memcpy( w, full, dir_len * sizeof(WCHAR) ); w += dir_len;
+            *w++ = '\\';
+            for (r = lang; *r; ) *w++ = *r++;
+            *w++ = '\\';
+            for (r = name; *r; ) *w++ = *r++;
+            for (r = muiext; *r; ) *w++ = *r++;
+            *w = 0;
+            sat = map_one_satellite( path, &map_size );
+            if (sat) break;
+            if (phase != 0) break;   /* enUS / en are single entries */
+        }
+    }
+    if (sat) *sat_end = (const char *)sat + map_size;
+    return sat;
+}
+
+/* cached lookup/creation of the satellite module for hmod */
+static HMODULE get_mui_satellite( HMODULE hmod )
+{
+    unsigned int i;
+    HMODULE sat;
+    const char *sat_end = NULL;
+
+    RtlEnterCriticalSection( &mui_cs );
+    for (i = 0; i < mui_cache_count; i++)
+        if (mui_cache[i].base == hmod)
+        {
+            sat = mui_cache[i].sat;
+            RtlLeaveCriticalSection( &mui_cs );
+            return sat;
+        }
+    RtlLeaveCriticalSection( &mui_cs );
+
+    sat = load_mui_satellite( hmod, &sat_end );
+
+    RtlEnterCriticalSection( &mui_cs );
+    for (i = 0; i < mui_cache_count; i++)
+        if (mui_cache[i].base == hmod)
+        {
+            HMODULE existing = mui_cache[i].sat;
+            RtlLeaveCriticalSection( &mui_cs );
+            if (sat && sat != existing) NtUnmapViewOfSection( NtCurrentProcess(), sat );
+            return existing;
+        }
+    if (mui_cache_count < ARRAY_SIZE(mui_cache))
+    {
+        mui_cache[mui_cache_count].base = hmod;
+        mui_cache[mui_cache_count].sat = sat;
+        mui_cache[mui_cache_count].sat_start = (const char *)sat;
+        mui_cache[mui_cache_count].sat_end = sat_end;
+        mui_cache_count++;
+    }
+    RtlLeaveCriticalSection( &mui_cs );
+    if (sat) TRACE( "loaded MUI satellite %p for module %p\n", sat, hmod );
+    return sat;
+}
+
+/* if entry lies inside a cached satellite of hmod, return that satellite base */
+static HMODULE satellite_for_entry( HMODULE hmod, const void *entry )
+{
+    unsigned int i;
+    HMODULE sat = NULL;
+    RtlEnterCriticalSection( &mui_cs );
+    for (i = 0; i < mui_cache_count; i++)
+        if (mui_cache[i].base == hmod && mui_cache[i].sat &&
+            (const char *)entry >= mui_cache[i].sat_start &&
+            (const char *)entry <  mui_cache[i].sat_end)
+        {
+            sat = mui_cache[i].sat;
+            break;
+        }
+    RtlLeaveCriticalSection( &mui_cs );
+    return sat;
+}
+
+/* find_entry, with a transparent fallback to the module's .mui satellite */
+static NTSTATUS find_entry_mui( HMODULE hmod, const LDR_RESOURCE_INFO *info,
+                                ULONG level, const void **ret, int want_dir )
+{
+    NTSTATUS status = find_entry( hmod, info, level, ret, want_dir );
+    if (status == STATUS_RESOURCE_TYPE_NOT_FOUND ||
+        status == STATUS_RESOURCE_NAME_NOT_FOUND ||
+        status == STATUS_RESOURCE_DATA_NOT_FOUND ||
+        status == STATUS_RESOURCE_LANG_NOT_FOUND)
+    {
+        HMODULE sat = get_mui_satellite( hmod );
+        if (sat)
+        {
+            const void *res2;
+            NTSTATUS s2 = find_entry( sat, info, level, &res2, want_dir );
+            if (s2 == STATUS_SUCCESS) { *ret = res2; return s2; }
+        }
+    }
+    return status;
+}
+
+
 /**********************************************************************
  *	LdrFindResourceDirectory_U  (NTDLL.@)
  */
@@ -267,7 +465,7 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResourceDirectory_U( HMODULE hmod, cons
                      level > 1 ? debugstr_w((LPCWSTR)info->Name) : "",
                      level > 2 ? info->Language : 0, level );
 
-        status = find_entry( hmod, info, level, &res, TRUE );
+        status = find_entry_mui( hmod, info, level, &res, TRUE );
         if (status == STATUS_SUCCESS) *dir = res;
     }
     __EXCEPT_PAGE_FAULT
@@ -295,7 +493,7 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResource_U( HMODULE hmod, const LDR_RES
                      level > 1 ? debugstr_w((LPCWSTR)info->Name) : "",
                      level > 2 ? info->Language : 0, level );
 
-        status = find_entry( hmod, info, level, &res, FALSE );
+        status = find_entry_mui( hmod, info, level, &res, FALSE );
         if (status == STATUS_SUCCESS) *entry = res;
     }
     __EXCEPT_PAGE_FAULT
@@ -321,7 +519,9 @@ static inline NTSTATUS access_resource( HMODULE hmod, const IMAGE_RESOURCE_DATA_
     __TRY
     {
         ULONG dirsize;
+        HMODULE sat = satellite_for_entry( hmod, entry );
 
+        if (sat) hmod = sat;
         if (!RtlImageDirectoryEntryToData( hmod, TRUE, IMAGE_DIRECTORY_ENTRY_RESOURCE, &dirsize ))
             status = STATUS_RESOURCE_DATA_NOT_FOUND;
         else
