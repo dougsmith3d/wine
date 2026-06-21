@@ -7085,7 +7085,10 @@ NTSTATUS WINAPI NtNotifyChangeDirectoryFile( HANDLE handle, HANDLE event, PIO_AP
            handle, event, apc, apc_context, iosb, buffer, buffer_size, filter, subtree );
 
     if (!iosb) return STATUS_ACCESS_VIOLATION;
-    if (filter == 0 || (filter & ~FILE_NOTIFY_ALL)) return STATUS_INVALID_PARAMETER;
+    /* Windows ignores CompletionFilter bits outside the known set rather than failing;
+       IIS nativrd2 config-change monitoring passes such bits (e.g. 0xfdb). Mask them. */
+    filter &= FILE_NOTIFY_ALL;
+    if (filter == 0) return STATUS_INVALID_PARAMETER;
 
     fileio = (struct async_fileio_read_changes *)alloc_fileio(
         offsetof(struct async_fileio_read_changes, data[size]), read_changes_apc, handle );
