@@ -1490,10 +1490,16 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetConsoleActiveScreenBuffer( HANDLE handle )
 BOOL WINAPI DECLSPEC_HOTPATCH SetConsoleCP( UINT cp )
 {
     struct condrv_input_info_params params = { SET_CONSOLE_INPUT_INFO_INPUT_CODEPAGE };
+    HANDLE handle = RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle;
+
+    /* Setting the codepage when the process has no console window is a harmless
+     * no-op on Windows. Some runtimes (e.g. Roslyn csc with /utf8output, via
+     * Console.OutputEncoding) set it unconditionally and treat failure as fatal,
+     * so don't fail with ERROR_INVALID_ACCESS here. */
+    if (!handle || handle == CONSOLE_HANDLE_SHELL_NO_WINDOW) return TRUE;
 
     params.info.input_cp = cp;
-    return console_ioctl( RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle,
-                          IOCTL_CONDRV_SET_INPUT_INFO, &params, sizeof(params), NULL, 0, NULL );
+    return console_ioctl( handle, IOCTL_CONDRV_SET_INPUT_INFO, &params, sizeof(params), NULL, 0, NULL );
 }
 
 
@@ -1644,10 +1650,13 @@ BOOL WINAPI DECLSPEC_HOTPATCH SetConsoleMode( HANDLE handle, DWORD mode )
 BOOL WINAPI DECLSPEC_HOTPATCH SetConsoleOutputCP( UINT cp )
 {
     struct condrv_input_info_params params = { SET_CONSOLE_INPUT_INFO_OUTPUT_CODEPAGE };
+    HANDLE handle = RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle;
+
+    /* See SetConsoleCP: no-op success when there is no console window. */
+    if (!handle || handle == CONSOLE_HANDLE_SHELL_NO_WINDOW) return TRUE;
 
     params.info.output_cp = cp;
-    return console_ioctl( RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle,
-                          IOCTL_CONDRV_SET_INPUT_INFO, &params, sizeof(params), NULL, 0, NULL );
+    return console_ioctl( handle, IOCTL_CONDRV_SET_INPUT_INFO, &params, sizeof(params), NULL, 0, NULL );
 }
 
 
