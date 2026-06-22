@@ -711,12 +711,18 @@ ULONG WINAPI HttpSendResponseEntityBody(HANDLE queue, HTTP_REQUEST_ID id,
     return ret;
 }
 
+struct group_url
+{
+    struct list entry;
+    WCHAR *url;
+    HTTP_URL_CONTEXT context;
+};
+
 struct url_group
 {
     struct list entry, session_entry;
     HANDLE queue;
-    WCHAR *url;
-    HTTP_URL_CONTEXT context;
+    struct list urls;
 };
 
 static struct list url_groups = LIST_INIT(url_groups);
@@ -816,6 +822,7 @@ ULONG WINAPI HttpCreateUrlGroup(HTTP_SERVER_SESSION_ID session_id, HTTP_URL_GROU
 
     if (!(group = calloc(1, sizeof(*group))))
         return ERROR_OUTOFMEMORY;
+    list_init(&group->urls);
     list_add_tail(&url_groups, &group->entry);
     list_add_tail(&session->groups, &group->session_entry);
 
@@ -830,12 +837,21 @@ ULONG WINAPI HttpCreateUrlGroup(HTTP_SERVER_SESSION_ID session_id, HTTP_URL_GROU
 ULONG WINAPI HttpCloseUrlGroup(HTTP_URL_GROUP_ID id)
 {
     struct url_group *group;
+    struct group_url *u, *u_next;
 
     TRACE("id %s.\n", wine_dbgstr_longlong(id));
 
     if (!(group = get_url_group(id)))
         return ERROR_INVALID_PARAMETER;
 
+    LIST_FOR_EACH_ENTRY_SAFE(u, u_next, &group->urls, struct group_url, entry)
+    {
+        if (group->queue)
+            remove_url(group->queue, u->url);
+        list_remove(&u->entry);
+        free(u->url);
+        free(u);
+    }
     list_remove(&group->session_entry);
     list_remove(&group->entry);
     free(group);
@@ -859,10 +875,12 @@ ULONG WINAPI HttpSetUrlGroupProperty(HTTP_URL_GROUP_ID id, HTTP_SERVER_PROPERTY 
         {
             const HTTP_BINDING_INFO *info = value;
 
+            struct group_url *u;
+
             TRACE("Binding to queue %p.\n", info->RequestQueueHandle);
             group->queue = info->RequestQueueHandle;
-            if (group->url)
-                add_url(group->queue, group->url, group->context);
+            LIST_FOR_EACH_ENTRY(u, &group->urls, struct group_url, entry)
+                add_url(group->queue, u->url, u->context);
             return ERROR_SUCCESS;
         }
         case HttpServerLoggingProperty:
@@ -881,27 +899,24 @@ ULONG WINAPI HttpAddUrlToUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url,
         HTTP_URL_CONTEXT context, ULONG reserved)
 {
     struct url_group *group = get_url_group(id);
+    struct group_url *u;
     ULONG ret;
 
     TRACE("id %s, url %s, context %s, reserved %#lx.\n", wine_dbgstr_longlong(id),
             debugstr_w(url), wine_dbgstr_longlong(context), reserved);
 
-    if (group->url)
-    {
-        FIXME("Multiple URLs are not handled!\n");
-        return ERROR_CALL_NOT_IMPLEMENTED;
-    }
+    if (group->queue && (ret = add_url(group->queue, url, context)))
+        return ret;
 
-    if (group->queue)
-    {
-        ret = add_url(group->queue, url, context);
-        if (ret)
-            return ret;
-    }
-
-    if (!(group->url = wcsdup(url)))
+    if (!(u = malloc(sizeof(*u))))
         return ERROR_OUTOFMEMORY;
-    group->context = context;
+    if (!(u->url = wcsdup(url)))
+    {
+        free(u);
+        return ERROR_OUTOFMEMORY;
+    }
+    u->context = context;
+    list_add_tail(&group->urls, &u->entry);
 
     return ERROR_SUCCESS;
 }
@@ -912,22 +927,26 @@ ULONG WINAPI HttpAddUrlToUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url,
 ULONG WINAPI HttpRemoveUrlFromUrlGroup(HTTP_URL_GROUP_ID id, const WCHAR *url, ULONG flags)
 {
     struct url_group *group = get_url_group(id);
+    struct group_url *u, *u_next;
+    ULONG ret = ERROR_FILE_NOT_FOUND;
 
     TRACE("id %s, url %s, flags %#lx.\n", wine_dbgstr_longlong(id), debugstr_w(url), flags);
 
-    if (!group->url)
-        return ERROR_FILE_NOT_FOUND;
+    LIST_FOR_EACH_ENTRY_SAFE(u, u_next, &group->urls, struct group_url, entry)
+    {
+        if (!(flags & HTTP_URL_FLAG_REMOVE_ALL) && wcscmp(u->url, url))
+            continue;
+        if (group->queue)
+            remove_url(group->queue, u->url);
+        list_remove(&u->entry);
+        free(u->url);
+        free(u);
+        ret = ERROR_SUCCESS;
+        if (!(flags & HTTP_URL_FLAG_REMOVE_ALL))
+            break;
+    }
 
-    if (flags)
-        FIXME("Ignoring flags %#lx.\n", flags);
-
-    free(group->url);
-    group->url = NULL;
-
-    if (group->queue)
-        return remove_url(group->queue, url);
-
-    return ERROR_SUCCESS;
+    return ret;
 }
 
 /***********************************************************************
