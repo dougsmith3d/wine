@@ -33,5 +33,5 @@
 @ stdcall HttpShutdownRequestQueue(ptr)
 @ stdcall HttpTerminate(long ptr)
 @ stub HttpWaitForDemandStart
-@ stub HttpWaitForDisconnect
-@ stub HttpWaitForDisconnectEx
+@ stdcall HttpWaitForDisconnect(ptr int64 ptr)
+@ stdcall HttpWaitForDisconnectEx(ptr int64 long ptr)

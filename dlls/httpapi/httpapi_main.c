@@ -365,6 +365,56 @@ ULONG WINAPI HttpReceiveHttpRequest(HANDLE queue, HTTP_REQUEST_ID id, ULONG flag
     return ret;
 }
 
+/***********************************************************************
+ *        HttpWaitForDisconnectEx     (HTTPAPI.@)
+ */
+ULONG WINAPI HttpWaitForDisconnectEx(HANDLE queue, HTTP_CONNECTION_ID id, ULONG reserved, OVERLAPPED *ovl)
+{
+    struct http_wait_for_disconnect_params params = {.id = id};
+    ULONG ret = ERROR_SUCCESS;
+    OVERLAPPED sync_ovl;
+
+    TRACE("queue %p, id %s, reserved %#lx, ovl %p.\n",
+            queue, wine_dbgstr_longlong(id), reserved, ovl);
+
+    if (reserved)
+        FIXME("Ignoring reserved %#lx.\n", reserved);
+
+    if (!ovl)
+    {
+        sync_ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        ovl = &sync_ovl;
+    }
+
+    if (!DeviceIoControl(queue, IOCTL_HTTP_WAIT_FOR_DISCONNECT, &params, sizeof(params), NULL, 0, NULL, ovl))
+        ret = GetLastError();
+
+    if (ovl == &sync_ovl)
+    {
+        DWORD ret_size;
+
+        if (ret == ERROR_IO_PENDING)
+        {
+            ret = ERROR_SUCCESS;
+            if (!GetOverlappedResult(queue, ovl, &ret_size, TRUE))
+                ret = GetLastError();
+        }
+        CloseHandle(sync_ovl.hEvent);
+    }
+
+    return ret;
+}
+
+/***********************************************************************
+ *        HttpWaitForDisconnect     (HTTPAPI.@)
+ */
+ULONG WINAPI HttpWaitForDisconnect(HANDLE queue, HTTP_CONNECTION_ID id, OVERLAPPED *ovl)
+{
+    TRACE("queue %p, id %s, ovl %p.\n", queue, wine_dbgstr_longlong(id), ovl);
+
+    return HttpWaitForDisconnectEx(queue, id, 0, ovl);
+}
+
 static void format_date(char *buffer)
 {
     static const char day_names[7][4] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};

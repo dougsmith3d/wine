@@ -29,6 +29,7 @@
 #define IOCTL_HTTP_SEND_RESPONSE    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, 0)
 #define IOCTL_HTTP_RECEIVE_BODY     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, 0)
 #define IOCTL_HTTP_NAME_QUEUE       CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, 0)
+#define IOCTL_HTTP_WAIT_FOR_DISCONNECT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, 0)
 
 struct http_add_url_params
 {
@@ -56,6 +57,11 @@ struct http_receive_body_params
 {
     HTTP_REQUEST_ID id;
     ULONG bits;
+};
+
+struct http_wait_for_disconnect_params
+{
+    HTTP_CONNECTION_ID id;
 };
 
 #endif

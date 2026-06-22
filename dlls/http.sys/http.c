@@ -57,6 +57,10 @@ struct connection
     unsigned int len, size;
     bool shutdown;
 
+    /* Pending IOCTL_HTTP_WAIT_FOR_DISCONNECT IRP, completed when the
+     * connection is torn down. */
+    IRP *disconnect_irp;
+
     /* If there is a request fully received and waiting to be read, the
      * "available" parameter will be TRUE. Either there is no queue matching
      * the URL of this request yet ("queue" is NULL), there is a queue but no
@@ -152,6 +156,17 @@ static void shutdown_connection(struct connection *conn)
 
 static void close_connection(struct connection *conn)
 {
+    if (conn->disconnect_irp)
+    {
+        IRP *irp = conn->disconnect_irp;
+
+        conn->disconnect_irp = NULL;
+        if (IoSetCancelRoutine(irp, NULL))
+        {
+            irp->IoStatus.Status = STATUS_SUCCESS;
+            IoCompleteRequest(irp, IO_NO_INCREMENT);
+        }
+    }
     if (!conn->shutdown)
         shutdown_connection(conn);
     closesocket(conn->socket);
@@ -1099,6 +1114,84 @@ static NTSTATUS http_receive_body(struct request_queue *queue, IRP *irp)
     return ret;
 }
 
+static struct connection *get_connection_by_id(HTTP_CONNECTION_ID id)
+{
+    struct connection *conn;
+
+    LIST_FOR_EACH_ENTRY(conn, &connections, struct connection, entry)
+    {
+        if ((ULONG_PTR)conn == id)
+            return conn;
+    }
+    return NULL;
+}
+
+static void WINAPI http_wait_for_disconnect_cancel(DEVICE_OBJECT *device, IRP *irp)
+{
+    struct connection *conn;
+
+    TRACE("device %p, irp %p.\n", device, irp);
+
+    IoReleaseCancelSpinLock(irp->CancelIrql);
+
+    EnterCriticalSection(&http_cs);
+    LIST_FOR_EACH_ENTRY(conn, &connections, struct connection, entry)
+    {
+        if (conn->disconnect_irp == irp)
+        {
+            conn->disconnect_irp = NULL;
+            break;
+        }
+    }
+    LeaveCriticalSection(&http_cs);
+
+    irp->IoStatus.Status = STATUS_CANCELLED;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+}
+
+/* IOCTL_HTTP_WAIT_FOR_DISCONNECT: pend the IRP on the given connection and
+ * complete it when that connection is torn down (see close_connection()). Used
+ * by http.sys clients such as IIS (via w3dt's HttpWaitForDisconnect) to abort
+ * work when the client goes away. An unknown or already-shutdown connection is
+ * treated as already disconnected and the IRP completes immediately. */
+static NTSTATUS http_wait_for_disconnect(struct request_queue *queue, IRP *irp)
+{
+    const struct http_wait_for_disconnect_params *params = irp->AssociatedIrp.SystemBuffer;
+    struct connection *conn;
+    NTSTATUS ret;
+
+    TRACE("id %s.\n", wine_dbgstr_longlong(params->id));
+
+    EnterCriticalSection(&http_cs);
+
+    if (!(conn = get_connection_by_id(params->id)) || conn->shutdown)
+    {
+        LeaveCriticalSection(&http_cs);
+        return STATUS_SUCCESS;
+    }
+
+    if (conn->disconnect_irp)
+    {
+        LeaveCriticalSection(&http_cs);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    IoSetCancelRoutine(irp, http_wait_for_disconnect_cancel);
+    if (irp->Cancel && IoSetCancelRoutine(irp, NULL))
+    {
+        ret = STATUS_CANCELLED;
+    }
+    else
+    {
+        IoMarkIrpPending(irp);
+        conn->disconnect_irp = irp;
+        ret = STATUS_PENDING;
+    }
+
+    LeaveCriticalSection(&http_cs);
+    return ret;
+}
+
 static NTSTATUS http_name_queue(struct request_queue *queue, IRP *irp);
 
 static NTSTATUS WINAPI dispatch_ioctl(DEVICE_OBJECT *device, IRP *irp)
@@ -1126,6 +1219,9 @@ static NTSTATUS WINAPI dispatch_ioctl(DEVICE_OBJECT *device, IRP *irp)
         break;
     case IOCTL_HTTP_NAME_QUEUE:
         ret = http_name_queue(queue, irp);
+        break;
+    case IOCTL_HTTP_WAIT_FOR_DISCONNECT:
+        ret = http_wait_for_disconnect(queue, irp);
         break;
     default:
         FIXME("Unhandled ioctl %#lx.\n", stack->Parameters.DeviceIoControl.IoControlCode);
