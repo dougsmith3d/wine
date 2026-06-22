@@ -380,28 +380,38 @@ static unsigned int compare_paths(const char *queue_path, const char *conn_path,
         return 0;
 }
 
-static BOOL host_matches(const struct url *url, const char *conn_host)
+static BOOL host_matches(const struct url *url, const char *conn_host, unsigned short local_port)
 {
-    size_t host_len;
+    const char *url_host, *url_port, *url_end;
+    size_t url_host_len;
 
     if (!url->url)
         return FALSE;
 
-    if (url->url[7] == '+' || url->url[7] == '*')
-    {
-        const char *queue_port = strchr(url->url + 7, ':');
-        host_len = strchr(queue_port, '/') - queue_port - 1;
-        if (!strncmp(queue_port, strchr(conn_host, ':'), host_len))
-            return TRUE;
-    }
-    else
-    {
-        host_len = strchr(url->url + 7, '/') - url->url - 7;
-        if (!memicmp(url->url + 7, conn_host, host_len))
-            return TRUE;
-    }
+    url_host = url->url + 7;                 /* skip "http://" */
+    url_port = strchr(url_host, ':');        /* ":port/..." */
+    url_end  = strchr(url_host, '/');        /* end of host:port authority */
+    if (!url_port || !url_end)
+        return FALSE;
 
-    return FALSE;
+    /* The Host header port is optional (absent for e.g. "Host: localhost"), so
+     * always disambiguate on the connection's actual local port instead. */
+    if (strtol(url_port + 1, NULL, 10) != local_port)
+        return FALSE;
+
+    /* A wildcard host ('+' or '*') matches any Host header. */
+    if (url_host[0] == '+' || url_host[0] == '*')
+        return TRUE;
+
+    /* Otherwise compare only the host portion (ignore any port in the Host
+     * header); the host part of conn_host must end right where ours does. */
+    if (!conn_host)
+        return FALSE;
+    url_host_len = url_port - url_host;
+    return !memicmp(url_host, conn_host, url_host_len)
+        && (conn_host[url_host_len] == ':' || conn_host[url_host_len] == '/'
+            || conn_host[url_host_len] == '\0' || conn_host[url_host_len] == '\r'
+            || conn_host[url_host_len] == '\n');
 }
 
 static struct url *url_matches(const struct connection *conn, const struct request_queue *queue,
@@ -411,6 +421,12 @@ static struct url *url_matches(const struct connection *conn, const struct reque
     unsigned int max_slash_count = 0, slash_count;
     size_t conn_path_len;
     struct url *url, *ret = NULL;
+    struct sockaddr_in local_addr;
+    int local_addr_len = sizeof(local_addr);
+    unsigned short local_port = 0;
+
+    if (!getsockname(conn->socket, (struct sockaddr *)&local_addr, &local_addr_len))
+        local_port = ntohs(local_addr.sin_port);
 
     if (conn->url[0] == '/')
     {
@@ -428,7 +444,7 @@ static struct url *url_matches(const struct connection *conn, const struct reque
 
     LIST_FOR_EACH_ENTRY(url, &queue->urls, struct url, entry)
     {
-        if (host_matches(url, conn_host))
+        if (host_matches(url, conn_host, local_port))
         {
             queue_path = strchr(url->url + 7, '/');
             if (!queue_path)
