@@ -1894,6 +1894,93 @@ static void test_v2_completion_port(void)
     ok(!ret, "Failed to close group, error %u.\n", ret);
 }
 
+static void test_v2_multiple_urls_and_portless_host(void)
+{
+    static const char portless_req[] =
+        "GET /foobar HTTP/1.1\r\n"
+        "Host: localhost\r\n"  /* no port: must route by the connection's local port */
+        "Connection: keep-alive\r\n"
+        "\r\n";
+    char DECLSPEC_ALIGN(8) req_buffer[2048];
+    HTTP_REQUEST_V1 *req = (HTTP_REQUEST_V1 *)req_buffer;
+    static const HTTPAPI_VERSION version = {2, 0};
+    HTTP_SERVER_SESSION_ID session;
+    HTTP_BINDING_INFO binding;
+    HTTP_URL_GROUP_ID group;
+    unsigned short port1, port2;
+    char req_text[100];
+    OVERLAPPED ovl;
+    DWORD ret_size;
+    WCHAR url2[50];
+    HANDLE queue;
+    int ret;
+    SOCKET s;
+
+    ovl.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    memset(req_buffer, 0xcc, sizeof(req_buffer));
+
+    ret = pHttpCreateServerSession(version, &session, 0);
+    ok(!ret, "Failed to create session, error %u.\n", ret);
+    ret = pHttpCreateUrlGroup(session, &group, 0);
+    ok(!ret, "Failed to create URL group, error %u.\n", ret);
+    ret = pHttpCreateRequestQueue(version, NULL, NULL, 0, &queue);
+    ok(!ret, "Failed to create request queue, error %u.\n", ret);
+    binding.Flags.Present = 1;
+    binding.RequestQueueHandle = queue;
+    ret = pHttpSetUrlGroupProperty(group, HttpServerBindingProperty, &binding, sizeof(binding));
+    ok(!ret, "Failed to bind request queue, error %u.\n", ret);
+
+    /* A single URL group must accept more than one URL (used to fail with
+     * ERROR_CALL_NOT_IMPLEMENTED, breaking any site with multiple bindings). */
+    port1 = add_url_v2(group);
+    for (port2 = port1 + 1; port2 < 51000; ++port2)
+    {
+        swprintf(url2, ARRAY_SIZE(url2), L"http://localhost:%u/", port2);
+        if (!(ret = pHttpAddUrlToUrlGroup(group, url2, 0xdeadbeef, 0)))
+            break;
+        ok(ret == ERROR_SHARING_VIOLATION || ret == ERROR_ALREADY_EXISTS,
+           "Adding a second URL %s returned unexpected error %u.\n", debugstr_w(url2), ret);
+    }
+    ok(port2 < 51000, "Could not add a second URL to the group.\n");
+
+    /* A request whose Host header has no port must still be dispatched
+     * (used to hang: routing keyed on the absent Host-header port). */
+    s = create_client_socket(port1);
+    ret = send(s, portless_req, strlen(portless_req), 0);
+    ok(ret == strlen(portless_req), "send() returned %d.\n", ret);
+    ret = HttpReceiveHttpRequest(queue, HTTP_NULL_ID, 0, (HTTP_REQUEST *)req, sizeof(req_buffer), &ret_size, &ovl);
+    if (ret == ERROR_IO_PENDING)
+        ret = (WaitForSingleObject(ovl.hEvent, 2000) == WAIT_OBJECT_0) ? 0 : -1;
+    ok(!ret, "Port-less Host request was not dispatched.\n");
+    if (!ret)
+    {
+        ok(req->ConnectionId, "Expected nonzero connection ID.\n");
+        send_response_v1(queue, req->RequestId, s);
+    }
+    closesocket(s);
+
+    /* The second URL must also serve. */
+    ResetEvent(ovl.hEvent);
+    s = create_client_socket(port2);
+    sprintf(req_text, simple_req, port2);
+    ret = send(s, req_text, strlen(req_text), 0);
+    ok(ret == strlen(req_text), "send() on 2nd URL returned %d.\n", ret);
+    ret = HttpReceiveHttpRequest(queue, HTTP_NULL_ID, 0, (HTTP_REQUEST *)req, sizeof(req_buffer), &ret_size, &ovl);
+    if (ret == ERROR_IO_PENDING)
+        ret = (WaitForSingleObject(ovl.hEvent, 2000) == WAIT_OBJECT_0) ? 0 : -1;
+    ok(!ret, "Request to the second URL was not dispatched.\n");
+    if (!ret)
+        send_response_v1(queue, req->RequestId, s);
+    closesocket(s);
+
+    swprintf(url2, ARRAY_SIZE(url2), L"http://localhost:%u/", port2);
+    pHttpRemoveUrlFromUrlGroup(group, url2, 0);
+    CloseHandle(ovl.hEvent);
+    pHttpCloseRequestQueue(queue);
+    pHttpCloseUrlGroup(group);
+    pHttpCloseServerSession(session);
+}
+
 START_TEST(httpapi)
 {
     HTTPAPI_VERSION version = { 1, 0 };
@@ -1930,6 +2017,7 @@ START_TEST(httpapi)
         test_v2_server();
         test_v2_queue_after_url();
         test_v2_bound_port();
+        test_v2_multiple_urls_and_portless_host();
         test_v2_completion_port();
 
         ret = HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
