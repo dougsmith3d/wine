@@ -80,6 +80,7 @@ enum alg_id
 
     /* key derivation */
     ALG_ID_PBKDF2,
+    ALG_ID_SP800108_CTR_HMAC,
 };
 
 enum chain_mode

@@ -128,6 +128,7 @@ builtin_algorithms[] =
     {  BCRYPT_DSA_ALGORITHM,        BCRYPT_SIGNATURE_INTERFACE,             0,      0,    0 },
     {  BCRYPT_RNG_ALGORITHM,        BCRYPT_RNG_INTERFACE,                   0,      0,    0 },
     {  BCRYPT_PBKDF2_ALGORITHM,     BCRYPT_KEY_DERIVATION_INTERFACE,      618,      0,    0 },
+    {  (const WCHAR *)L"SP800_108_CTR_HMAC", BCRYPT_KEY_DERIVATION_INTERFACE, 618, 0, 0 },
 };
 
 static inline BOOL is_symmetric_key( const struct key *key )
@@ -690,6 +691,7 @@ static NTSTATUS get_alg_property( const struct algorithm *alg, const WCHAR *prop
         return get_dsa_property( alg->mode, prop, buf, size, ret_size );
 
     case ALG_ID_PBKDF2:
+    case ALG_ID_SP800108_CTR_HMAC:
 	return get_pbkdf2_property( alg->mode, prop, buf, size, ret_size );
 
     default:
@@ -1253,7 +1255,7 @@ static NTSTATUS key_symmetric_generate( struct algorithm *alg, BCRYPT_KEY_HANDLE
     struct key *key;
     NTSTATUS status;
 
-    if (alg->id == ALG_ID_PBKDF2 &&
+    if ((alg->id == ALG_ID_PBKDF2 || alg->id == ALG_ID_SP800108_CTR_HMAC) &&
             !get_alg_property( alg, BCRYPT_KEY_LENGTHS, (UCHAR *)&key_lengths, sizeof(key_lengths), &size ))
     {
         if (secret_len > key_lengths.dwMaxLength / 8 || secret_len < key_lengths.dwMinLength / 8)
@@ -2783,21 +2785,59 @@ NTSTATUS WINAPI BCryptDeriveKey( BCRYPT_SECRET_HANDLE handle, const WCHAR *kdf, 
     return STATUS_NOT_SUPPORTED;
 }
 
+static NTSTATUS derive_key_sp800108( struct algorithm *alg, UCHAR *kdk, ULONG kdk_len, UCHAR *label,
+                                     ULONG label_len, UCHAR *context, ULONG context_len, UCHAR *output, ULONG output_len )
+{
+    ULONG hash_len, blocks, i, off = 0, bits = output_len * 8;
+    UCHAR ctr[4], lbits[4], zero = 0, *buf;
+    struct hash *hash;
+    NTSTATUS status;
+
+    if (!alg || !output_len) return STATUS_INVALID_PARAMETER;
+    hash_len = builtin_algorithms[alg->id].hash_length;
+    if (!hash_len) return STATUS_INVALID_PARAMETER;
+    blocks = 1 + (output_len - 1) / hash_len;
+    if (!(buf = malloc( hash_len ))) return STATUS_NO_MEMORY;
+    if ((status = hash_create( alg, kdk, kdk_len, BCRYPT_HASH_REUSABLE_FLAG, &hash )))
+    {
+        free( buf );
+        return status;
+    }
+    lbits[0] = (bits >> 24) & 0xff; lbits[1] = (bits >> 16) & 0xff; lbits[2] = (bits >> 8) & 0xff; lbits[3] = bits & 0xff;
+    for (i = 1; i <= blocks; i++)
+    {
+        ULONG take;
+        ctr[0] = (i >> 24) & 0xff; ctr[1] = (i >> 16) & 0xff; ctr[2] = (i >> 8) & 0xff; ctr[3] = i & 0xff;
+        hash->desc->process( &hash->inner, ctr, 4 );
+        if (label_len) hash->desc->process( &hash->inner, label, label_len );
+        hash->desc->process( &hash->inner, &zero, 1 );
+        if (context_len) hash->desc->process( &hash->inner, context, context_len );
+        hash->desc->process( &hash->inner, lbits, 4 );
+        hash_finalize( hash, buf );
+        take = (off + hash_len <= output_len) ? hash_len : (output_len - off);
+        memcpy( output + off, buf, take );
+        off += take;
+    }
+    hash_destroy( hash );
+    free( buf );
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS WINAPI BCryptKeyDerivation( BCRYPT_KEY_HANDLE handle, BCryptBufferDesc *desc,
                                      UCHAR *output, ULONG output_size, ULONG *ret_len, ULONG flags )
 {
     struct key *key = get_key_object( handle );
     struct algorithm *alg = NULL;
     ULONGLONG iter_count = 10000;
-    ULONG salt_size = 0;
-    UCHAR *salt = NULL;
+    ULONG salt_size = 0, label_size = 0, context_size = 0;
+    UCHAR *salt = NULL, *label = NULL, *context = NULL;
     NTSTATUS status;
     ULONG i;
 
     TRACE( "%p, %p, %p, %lu, %p, %#lx\n", key, desc, output, output_size, ret_len, flags );
 
     if (!key || !desc || !ret_len) return STATUS_INVALID_PARAMETER;
-    if (key->alg_id != ALG_ID_PBKDF2)
+    if (key->alg_id != ALG_ID_PBKDF2 && key->alg_id != ALG_ID_SP800108_CTR_HMAC)
     {
         FIXME( "unsupported key %d\n", key->alg_id );
         return STATUS_NOT_IMPLEMENTED;
@@ -2818,14 +2858,26 @@ NTSTATUS WINAPI BCryptKeyDerivation( BCRYPT_KEY_HANDLE handle, BCryptBufferDesc 
             if (desc->pBuffers[i].cbBuffer != sizeof(ULONGLONG)) return STATUS_INVALID_PARAMETER;
             iter_count = *(ULONGLONG *)desc->pBuffers[i].pvBuffer;
             break;
+        case KDF_LABEL:
+            label = desc->pBuffers[i].pvBuffer;
+            label_size = desc->pBuffers[i].cbBuffer;
+            break;
+        case KDF_CONTEXT:
+            context = desc->pBuffers[i].pvBuffer;
+            context_size = desc->pBuffers[i].cbBuffer;
+            break;
         default:
             FIXME( "buffer type %lu not supported\n", desc->pBuffers[i].BufferType );
             break;
         }
     }
 
-    status = derive_key_pbkdf2( alg, key->u.s.secret, key->u.s.secret_len,
-            salt, salt_size, iter_count, output, output_size );
+    if (key->alg_id == ALG_ID_SP800108_CTR_HMAC)
+        status = derive_key_sp800108( alg, key->u.s.secret, key->u.s.secret_len, label, label_size,
+                context, context_size, output, output_size );
+    else
+        status = derive_key_pbkdf2( alg, key->u.s.secret, key->u.s.secret_len,
+                salt, salt_size, iter_count, output, output_size );
     if (!status) *ret_len = output_size;
     return status;
 }
