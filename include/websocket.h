@@ -47,6 +47,19 @@ VOID WINAPI WebSocketAbortHandle(WEB_SOCKET_HANDLE);
 HRESULT WINAPI WebSocketCreateClientHandle(const PWEB_SOCKET_PROPERTY, ULONG, WEB_SOCKET_HANDLE*);
 VOID WINAPI WebSocketDeleteHandle(WEB_SOCKET_HANDLE);
 
+typedef struct _WEB_SOCKET_HTTP_HEADER
+{
+    PCHAR pcName;
+    ULONG ulNameLength;
+    PCHAR pcValue;
+    ULONG ulValueLength;
+} WEB_SOCKET_HTTP_HEADER, *PWEB_SOCKET_HTTP_HEADER;
+
+HRESULT WINAPI WebSocketBeginClientHandshake(WEB_SOCKET_HANDLE, const PSTR*, ULONG, const PSTR*, ULONG,
+    const PWEB_SOCKET_HTTP_HEADER, ULONG, PWEB_SOCKET_HTTP_HEADER*, ULONG*);
+HRESULT WINAPI WebSocketGetGlobalProperty(WEB_SOCKET_PROPERTY_TYPE, PVOID, ULONG*);
+
+
 #ifdef __cplusplus
 }
 #endif
