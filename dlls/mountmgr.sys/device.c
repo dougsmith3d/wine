@@ -1696,6 +1696,22 @@ static NTSTATUS WINAPI harddisk_query_volume( DEVICE_OBJECT *device, IRP *irp )
 
         break;
     }
+    case FileFsDeviceInformation:
+    {
+        FILE_FS_DEVICE_INFORMATION *info = irp->AssociatedIrp.SystemBuffer;
+
+        if (length < sizeof(FILE_FS_DEVICE_INFORMATION))
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        info->DeviceType = dev->devnum.DeviceType;
+        info->Characteristics = FILE_DEVICE_IS_MOUNTED;
+        io->Information = sizeof(*info);
+        status = STATUS_SUCCESS;
+        break;
+    }
     case FileFsAttributeInformation:
     {
         FILE_FS_ATTRIBUTE_INFORMATION *info = irp->AssociatedIrp.SystemBuffer;
