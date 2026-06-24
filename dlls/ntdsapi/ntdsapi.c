@@ -215,6 +215,76 @@ DWORD WINAPI DsMakeSpnA(LPCSTR svc_class, LPCSTR svc_name,
 }
 
 /***********************************************************************
+ *             DsGetSpnW (NTDSAPI.@)
+ */
+DWORD WINAPI DsGetSpnW(DS_SPN_NAME_TYPE ServType, LPCWSTR ServClass, LPCWSTR ServName,
+                       USHORT InstPort, USHORT cInstanceNames,
+                       LPCWSTR *pInstanceNames, const USHORT *pInstancePorts,
+                       DWORD *pcSpn, LPWSTR **prpszSpn)
+{
+    DWORD count, i = 0, ret = ERROR_SUCCESS;
+    LPWSTR *array;
+
+    TRACE("(%d,%s,%s,%d,%d,%p,%p,%p,%p)\n", ServType, debugstr_w(ServClass),
+          debugstr_w(ServName), InstPort, cInstanceNames, pInstanceNames,
+          pInstancePorts, pcSpn, prpszSpn);
+
+    if (!pcSpn || !prpszSpn)
+        return ERROR_INVALID_PARAMETER;
+
+    count = cInstanceNames ? cInstanceNames : 1;
+    array = malloc(count * sizeof(*array));
+    if (!array)
+        return ERROR_NOT_ENOUGH_MEMORY;
+
+    for (i = 0; i < count; i++)
+    {
+        LPCWSTR inst = cInstanceNames ? pInstanceNames[i] : NULL;
+        USHORT port = cInstanceNames ? (pInstancePorts ? pInstancePorts[i] : 0) : InstPort;
+        DWORD len = 0;
+
+        DsMakeSpnW(ServClass, ServName, inst, port, NULL, &len, NULL);
+        array[i] = malloc(len * sizeof(WCHAR));
+        if (!array[i])
+        {
+            ret = ERROR_NOT_ENOUGH_MEMORY;
+            break;
+        }
+        DsMakeSpnW(ServClass, ServName, inst, port, NULL, &len, array[i]);
+    }
+
+    if (ret != ERROR_SUCCESS)
+    {
+        while (i--)
+            free(array[i]);
+        free(array);
+        return ret;
+    }
+
+    *pcSpn = count;
+    *prpszSpn = array;
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
+ *             DsFreeSpnArrayW (NTDSAPI.@)
+ */
+DWORD WINAPI DsFreeSpnArrayW(DWORD cSpn, LPWSTR *rpszSpn)
+{
+    DWORD i;
+
+    TRACE("(%ld,%p)\n", cSpn, rpszSpn);
+
+    if (rpszSpn)
+    {
+        for (i = 0; i < cSpn; i++)
+            free(rpszSpn[i]);
+        free(rpszSpn);
+    }
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
  *             DsMakeSpnA (NTDSAPI.@)
  */
 DWORD WINAPI DsGetSpnA(DS_SPN_NAME_TYPE ServType, LPCSTR Servlass, LPCSTR ServName,
