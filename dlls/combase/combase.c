@@ -1736,6 +1736,13 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoCreateInstance(REFCLSID rclsid, IUnknown *out
 
     hr = CoCreateInstanceEx(rclsid, outer, cls_context, NULL, 1, &multi_qi);
     *obj = multi_qi.pItf;
+    if (rclsid && ((const DWORD*)rclsid)[0] == 0xbdeadf25)
+    {
+        void *frames[14]; USHORT nf = RtlCaptureStackBackTrace(0, 14, frames, NULL); int fi;
+        MESSAGE("wine_sp_fix: CoCreateInstance(BDEADF25 SPNativeConfigProvider) ctx=%#lx hr=0x%08lx obj=%p qi-hr=0x%08lx\n",
+                cls_context, hr, multi_qi.pItf, multi_qi.hr);
+        for (fi = 0; fi < nf; fi++) MESSAGE("wine_sp_fix:   ccbt[%d]=%p\n", fi, frames[fi]);
+    }
     return hr;
 }
 

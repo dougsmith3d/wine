@@ -38,6 +38,8 @@
 #include "windef.h"
 #include "winbase.h"
 #include "wincrypt.h"
+#include "bcrypt.h"
+#include "ncrypt.h"
 #include "snmp.h"
 #include "wine/debug.h"
 #include "wine/exception.h"
@@ -5025,6 +5027,76 @@ typedef BOOL (WINAPI *EncodePublicKeyAndParametersFunc)(DWORD dwCertEncodingType
  LPSTR pszPublicKeyObjId, BYTE *pbPubKey, DWORD cbPubKey, DWORD dwFlags, void *pvAuxInfo,
  BYTE **ppPublicKey, DWORD *pcbPublicKey, BYTE **ppbParams, DWORD *pcbParams);
 
+/* Export the public key of a CNG (NCRYPT) RSA key into a CERT_PUBLIC_KEY_INFO.
+ * SQL Server 2022 creates its self-signed fallback cert key via
+ * NCryptCreatePersistedKey and hands the NCRYPT_KEY_HANDLE to
+ * CertCreateSelfSignCertificate; the legacy CryptGetUserKey path cannot reach
+ * such a key, so route it through NCryptExportKey here. */
+static BOOL CRYPT_ExportCNGPublicKeyInfo(NCRYPT_KEY_HANDLE hKey,
+ DWORD dwCertEncodingType, PCERT_PUBLIC_KEY_INFO pInfo, DWORD *pcbInfo)
+{
+    static CHAR rsa_oid[] = szOID_RSA_RSA;
+    SECURITY_STATUS status;
+    BYTE *blob;
+    DWORD blobLen = 0, encodedLen = 0, oidLen, sizeNeeded;
+    BOOL ret;
+
+    status = NCryptExportKey(hKey, 0, BCRYPT_RSAPUBLIC_BLOB, NULL, NULL, 0, &blobLen, 0);
+    if (status != ERROR_SUCCESS || !blobLen)
+    {
+        SetLastError(status ? status : (DWORD)NTE_BAD_KEY);
+        return FALSE;
+    }
+    if (!(blob = CryptMemAlloc(blobLen)))
+    {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return FALSE;
+    }
+    status = NCryptExportKey(hKey, 0, BCRYPT_RSAPUBLIC_BLOB, NULL, blob, blobLen, &blobLen, 0);
+    if (status != ERROR_SUCCESS)
+    {
+        CryptMemFree(blob);
+        SetLastError(status);
+        return FALSE;
+    }
+    ret = CryptEncodeObject(dwCertEncodingType, CNG_RSA_PUBLIC_KEY_BLOB, blob, NULL, &encodedLen);
+    if (ret)
+    {
+        oidLen = strlen(rsa_oid) + 1;
+        sizeNeeded = sizeof(CERT_PUBLIC_KEY_INFO) + oidLen + encodedLen;
+        if (!pInfo)
+            *pcbInfo = sizeNeeded;
+        else if (*pcbInfo < sizeNeeded)
+        {
+            *pcbInfo = sizeNeeded;
+            SetLastError(ERROR_MORE_DATA);
+            ret = FALSE;
+        }
+        else
+        {
+            *pcbInfo = sizeNeeded;
+            pInfo->Algorithm.pszObjId = (char *)pInfo + sizeof(CERT_PUBLIC_KEY_INFO);
+            lstrcpyA(pInfo->Algorithm.pszObjId, rsa_oid);
+            pInfo->Algorithm.Parameters.cbData = 0;
+            pInfo->Algorithm.Parameters.pbData = NULL;
+            pInfo->PublicKey.pbData = (BYTE *)pInfo->Algorithm.pszObjId + oidLen;
+            pInfo->PublicKey.cbData = encodedLen;
+            pInfo->PublicKey.cUnusedBits = 0;
+            ret = CryptEncodeObject(dwCertEncodingType, CNG_RSA_PUBLIC_KEY_BLOB, blob,
+             pInfo->PublicKey.pbData, &pInfo->PublicKey.cbData);
+        }
+    }
+    CryptMemFree(blob);
+    return ret;
+}
+
+WINBASEAPI BOOL WINAPI NCryptIsKeyHandle(NCRYPT_KEY_HANDLE);
+
+BOOL CRYPT_IsCNGKeyHandle(ULONG_PTR handle)
+{
+    return NCryptIsKeyHandle(handle);
+}
+
 static BOOL WINAPI CRYPT_ExportPublicKeyInfoEx(HCRYPTPROV_OR_NCRYPT_KEY_HANDLE hCryptProv,
  DWORD dwKeySpec, DWORD dwCertEncodingType, LPSTR pszPublicKeyObjId,
  DWORD dwFlags, void *pvAuxInfo, PCERT_PUBLIC_KEY_INFO pInfo, DWORD *pcbInfo)
@@ -5036,6 +5108,9 @@ static BOOL WINAPI CRYPT_ExportPublicKeyInfoEx(HCRYPTPROV_OR_NCRYPT_KEY_HANDLE h
     TRACE_(crypt)("(%08Ix, %ld, %08lx, %s, %08lx, %p, %p, %ld)\n", hCryptProv,
      dwKeySpec, dwCertEncodingType, debugstr_a(pszPublicKeyObjId), dwFlags,
      pvAuxInfo, pInfo, pInfo ? *pcbInfo : 0);
+
+    if (CRYPT_IsCNGKeyHandle(hCryptProv))
+        return CRYPT_ExportCNGPublicKeyInfo(hCryptProv, dwCertEncodingType, pInfo, pcbInfo);
 
     if ((ret = CryptGetUserKey(hCryptProv, dwKeySpec, &key)))
     {

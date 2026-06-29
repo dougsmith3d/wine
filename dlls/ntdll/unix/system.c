@@ -1613,6 +1613,11 @@ void init_cpu_info(void)
     num = 1;
     FIXME("Detecting the number of processors is not supported.\n");
 #endif
+    {
+        const char *force_n = getenv("WINE_FORCE_NCPU");
+        if (force_n && atoi(force_n) > 0) { num = atoi(force_n); ERR("wine_sp_fix: forcing NumberOfProcessors=%ld (WINE_FORCE_NCPU)\n", num); }
+        else if (getenv("WINE_FORCE_1CPU")) { num = 1; ERR("wine_sp_fix: forcing NumberOfProcessors=1 (WINE_FORCE_1CPU)\n"); }
+    }
     peb->NumberOfProcessors = num;
     init_cpu_model();
 }

@@ -239,6 +239,162 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         break;
     }
 
+    /* DIAG (SharePoint OWSSVR): decode the MSVC C++ exception type name. x64 throw:
+     * info[0]=magic 0x19930520..22, info[2]=ThrowInfo*, info[3]=imagebase; ThrowInfo
+     * +12 = pCatchableTypeArray RVA; array+4 = first CatchableType RVA; CT+4 = pType
+     * RVA -> TypeDescriptor; TD+16 = mangled name. */
+    if (rec->ExceptionCode == 0xe06d7363 && rec->NumberParameters >= 4 &&
+        (rec->ExceptionInformation[0] & ~3) == 0x19930520 && rec->ExceptionInformation[3])
+    {
+        ULONG_PTR base = rec->ExceptionInformation[3];
+        const int *ti = (const int *)rec->ExceptionInformation[2];
+        if (ti && ti[3])
+        {
+            const int *cta = (const int *)(base + (unsigned int)ti[3]);
+            if (cta[0] > 0)
+            {
+                const int *ct = (const int *)(base + (unsigned int)cta[1]);
+                if (ct[1])
+                {
+                    const char *tn = (const char *)(base + (unsigned int)ct[1] + 16);
+                    MESSAGE( "wine_cxx_throw tid=%04x type=%s\n", (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, tn );
+                    if (strstr( tn, "HRException" ) || strstr( tn, "Vstatus" ) || strstr( tn, "genericStatus" ))
+                    {
+                        const unsigned int *obj = (const unsigned int *)rec->ExceptionInformation[1];
+                        if (obj)
+                        {
+                            const unsigned int *d0 = (const unsigned int *)(ULONG_PTR)(((const ULONG_PTR *)obj)[0]);
+                            MESSAGE( "wine_sp_fix: %s obj dw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                     strstr(tn,"Vstatus")?"Vstatus":strstr(tn,"genericStatus")?"VgenStatus":"HRException",
+                                     obj[0],obj[1],obj[2],obj[3],obj[4],obj[5],obj[6],obj[7] );
+                            if (d0) MESSAGE( "wine_sp_fix:   *obj[0] dw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                             d0[0],d0[1],d0[2],d0[3],d0[4],d0[5],d0[6],d0[7] );
+                            if (d0)
+                            {
+                                ULONG_PTR pp; const WCHAR *w;
+                                pp = ((const ULONG_PTR *)d0)[2]; w = (const WCHAR *)pp;
+                                if (w) MESSAGE( "wine_sp_fix:   ptrA -> w%.80ls\n", w );
+                                pp = ((const ULONG_PTR *)d0)[3]; w = (const WCHAR *)pp;
+                                if (w) MESSAGE( "wine_sp_fix:   ptrB -> w%.80ls\n", w );
+                            }
+                            if (strstr(tn,"HRException"))
+                            {
+                                const WCHAR *w = (const WCHAR *)(d0 ? (const void*)&d0[5] : (const void*)0);
+                                if (w) MESSAGE( "wine_sp_fix:   HRExc str: w%.80ls\n", w );
+                            }
+                        }
+                    }
+                    /* For the SharePoint Vstatus culprit, do a PROPER x64 stack unwind and
+                     * resolve each return address to module+offset (RtlPcToFileHeader). */
+                    static int hrdumps; if (tn[0] && context && (strstr(tn,"Vstatus") || (strstr(tn,"HRException") && hrdumps++ < 3)))
+                    {
+                        CONTEXT c = *context;
+                        unsigned int depth;
+                        MESSAGE( "wine_cxx_stack rip=%p\n", (void *)c.Rip );
+                        for (depth = 0; depth < 24 && c.Rip; depth++)
+                        {
+                            void *base = NULL;
+                            ULONG_PTR img = (ULONG_PTR)RtlPcToFileHeader( (void *)c.Rip, &base );
+                            ULONG_PTR uoff = base ? c.Rip - (ULONG_PTR)base : 0;
+                            MESSAGE( "wine_cxx_uw [%u] rip=%p mod=%p off=%p r15=%p r14=%p\n",
+                                     depth, (void *)c.Rip, base, (void *)uoff,
+                                     (void *)c.R15, (void *)c.R14 );
+                            if (strstr(tn,"Vstatus") && uoff >= 0x46120 && uoff <= 0x46700 && c.R15 && c.R14)
+                            {
+                                struct sp_guid { unsigned int d1; unsigned short d2,d3; unsigned char d4[8]; };
+                                const struct sp_guid *iid = (const struct sp_guid *)(ULONG_PTR)c.R15;
+                                const struct sp_guid *key = (const struct sp_guid *)(ULONG_PTR)c.R14;
+                                MESSAGE( "wine_sp_fix: QI-IID    {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
+                                         iid->d1, iid->d2, iid->d3,
+                                         iid->d4[0],iid->d4[1],iid->d4[2],iid->d4[3],iid->d4[4],iid->d4[5],iid->d4[6],iid->d4[7] );
+                                MESSAGE( "wine_sp_fix: cache-key {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n",
+                                         key->d1, key->d2, key->d3,
+                                         key->d4[0],key->d4[1],key->d4[2],key->d4[3],key->d4[4],key->d4[5],key->d4[6],key->d4[7] );
+                                /* read the cached COM object (local_390 @ getInternal rsp+0x58) and ID whose QueryInterface returned E_NOTIMPL */
+                                __TRY
+                                {
+                                    void **obj = *(void ***)(ULONG_PTR)(c.Rsp + 0x58);
+                                    void **obj2 = *(void ***)(ULONG_PTR)(c.Rsp + 0x50);
+                                    MESSAGE( "wine_sp_fix: QI-obj[+0x58]=%p obj[+0x50]=%p\n", obj, obj2 );
+                                    if (obj)
+                                    {
+                                        void **vt = (void **)*obj;
+                                        void *mb = NULL;
+                                        if (vt)
+                                        {
+                                            RtlPcToFileHeader( vt[0], &mb );
+                                            MESSAGE( "wine_sp_fix: QI-vtbl=%p QIfn=%p QIfn-mod=%p off=%p  AddRef=%p Rel=%p m3=%p\n",
+                                                     vt, vt[0], mb,
+                                                     (void *)(mb ? (ULONG_PTR)vt[0]-(ULONG_PTR)mb : 0), vt[1], vt[2], vt[3] );
+                                        }
+                                    }
+                                    if (obj2)
+                                    {
+                                        void **vt2 = (void **)*obj2; void *mb2 = NULL;
+                                        if (vt2) { RtlPcToFileHeader( vt2[0], &mb2 ); MESSAGE( "wine_sp_fix: QI(+0x50)-QIfn=%p mod=%p\n", vt2[0], mb2 ); }
+                                    }
+                                    /* LIVE PROBE: re-QI the cached CCW for the failing IID + IUnknown + IDispatch, log each HR */
+                                    if (obj)
+                                    {
+                                        typedef long (WINAPI *qi_t)(void*, const void*, void**);
+                                        qi_t qi = (qi_t)((void**)*obj)[0];
+                                        unsigned char IID_IUnknown[16] = {0,0,0,0,0,0,0,0,0xC0,0,0,0,0,0,0,0x46};
+                                        unsigned char IID_IDispatch[16] = {0x00,0x04,0x02,0x00,0,0,0,0,0xC0,0,0,0,0,0,0,0x46};
+                                        void *out = NULL; long hr;
+                                        hr = qi( obj, (const void*)(ULONG_PTR)c.R15, &out );
+                                        MESSAGE( "wine_sp_fix: PROBE QI(failing-IID) hr=0x%08lx out=%p\n", hr & 0xffffffff, out );
+                                        out = NULL; hr = qi( obj, IID_IUnknown, &out );
+                                        MESSAGE( "wine_sp_fix: PROBE QI(IUnknown) hr=0x%08lx out=%p\n", hr & 0xffffffff, out );
+                                        out = NULL; hr = qi( obj, IID_IDispatch, &out );
+                                        MESSAGE( "wine_sp_fix: PROBE QI(IDispatch) hr=0x%08lx out=%p\n", hr & 0xffffffff, out );
+                                    }
+                                    /* LIVE PROBE: re-QI the cached CCW for the failing IID + IUnknown + IDispatch, log each HR */
+                                    if (obj)
+                                    {
+                                        typedef long (WINAPI *qi_t)(void*, const void*, void**);
+                                        qi_t qi = (qi_t)((void**)*obj)[0];
+                                        unsigned char IID_IUnknown[16] = {0,0,0,0,0,0,0,0,0xC0,0,0,0,0,0,0,0x46};
+                                        unsigned char IID_IDispatch[16] = {0x00,0x04,0x02,0x00,0,0,0,0,0xC0,0,0,0,0,0,0,0x46};
+                                        void *out = NULL; long hr;
+                                        hr = qi( obj, (const void*)(ULONG_PTR)c.R15, &out );
+                                        MESSAGE( "wine_sp_fix: PROBE QI(failing-IID) hr=0x%08lx out=%p\n", hr & 0xffffffff, out );
+                                        out = NULL; hr = qi( obj, IID_IUnknown, &out );
+                                        MESSAGE( "wine_sp_fix: PROBE QI(IUnknown) hr=0x%08lx out=%p\n", hr & 0xffffffff, out );
+                                        out = NULL; hr = qi( obj, IID_IDispatch, &out );
+                                        MESSAGE( "wine_sp_fix: PROBE QI(IDispatch) hr=0x%08lx out=%p\n", hr & 0xffffffff, out );
+                                    }
+                                }
+                                __EXCEPT_ALL
+                                {
+                                    MESSAGE( "wine_sp_fix: QI-obj read faulted %08lx\n", GetExceptionCode() );
+                                }
+                                __ENDTRY
+                            }
+                            {
+                                ULONG_PTR imgbase = 0; void *handler_data = NULL; ULONG_PTR establisher = 0;
+                                RUNTIME_FUNCTION *func = RtlLookupFunctionEntry( c.Rip, &imgbase, NULL );
+                                if (!func)
+                                {
+                                    /* leaf: pop return addr off the stack */
+                                    c.Rip = *(ULONG_PTR *)c.Rsp;
+                                    c.Rsp += 8;
+                                }
+                                else
+                                {
+                                    KNONVOLATILE_CONTEXT_POINTERS ptrs = {{0}};
+                                    RtlVirtualUnwind( UNW_FLAG_NHANDLER, imgbase, c.Rip, func,
+                                                      &c, &handler_data, &establisher, &ptrs );
+                                    if (!c.Rip) break;
+                                }
+                                (void)img;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     TRACE( "code=%lx (%s) flags=%lx addr=%p\n",
            rec->ExceptionCode, debugstr_exception_code(rec->ExceptionCode),
            rec->ExceptionFlags, rec->ExceptionAddress );

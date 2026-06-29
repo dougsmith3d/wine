@@ -1196,7 +1196,15 @@ static SECURITY_STATUS SEC_ENTRY schan_QueryContextAttributesW(
 
             /* These are defined by the TLS RFC */
             stream_sizes->cbHeader = ctx->header_size;
-            stream_sizes->cbTrailer = mac_size + 256; /* Max 255 bytes padding + 1 for padding size */
+            /* For AEAD ciphers (AES-GCM / ChaCha20-Poly1305, mac_size == 0) the actual
+             * record trailer is only the auth tag (+ a possible explicit nonce), well
+             * under 32 bytes; there is no CBC block padding.  Reporting the legacy
+             * worst-case CBC padding allowance ("mac_size + 256") for an AEAD connection
+             * makes some stream consumers (notably SQL Server 2008 R2's SNI, whose
+             * Ssl::Handshake completion validates cbHeader + cbTrailer*2 against its own
+             * fixed SSL buffer) reject the connection and tear it down before any data is
+             * decrypted.  Report a correct, tight trailer for AEAD ciphers. */
+            stream_sizes->cbTrailer = mac_size ? mac_size + 256 : 32;
             stream_sizes->cbMaximumMessage = message_size;
             stream_sizes->cBuffers = 4;
             stream_sizes->cbBlockSize = block_size;

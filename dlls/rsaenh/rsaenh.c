@@ -203,6 +203,9 @@ static const PROV_ENUMALGS_EX aProvEnumAlgsEx[5][RSAENH_MAX_ENUMALGS+1] =
   {CALG_3DES_112, 112, 112, 112, 0, S("3DES TWO KEY"), S("Two Key Triple DES")},
   {CALG_3DES, 168, 168, 168, 0, S("3DES"), S("Three Key Triple DES")},
   {CALG_SHA, 160, 160, 160, CRYPT_FLAG_SIGNING, S("SHA-1"), S("Secure Hash Algorithm (SHA-1)")},
+  {CALG_SHA_256, 256, 256, 256, CRYPT_FLAG_SIGNING, S("SHA-256"), S("Secure Hash Algorithm (SHA-256)")},
+  {CALG_SHA_384, 384, 384, 384, CRYPT_FLAG_SIGNING, S("SHA-384"), S("Secure Hash Algorithm (SHA-384)")},
+  {CALG_SHA_512, 512, 512, 512, CRYPT_FLAG_SIGNING, S("SHA-512"), S("Secure Hash Algorithm (SHA-512)")},
   {CALG_MD2, 128, 128, 128, CRYPT_FLAG_SIGNING, S("MD2"), S("Message Digest 2 (MD2)")},
   {CALG_MD4, 128, 128, 128, CRYPT_FLAG_SIGNING, S("MD4"), S("Message Digest 4 (MD4)")},
   {CALG_MD5, 128, 128, 128, CRYPT_FLAG_SIGNING, S("MD5"), S("Message Digest 5 (MD5)")},
@@ -2666,7 +2669,13 @@ BOOL WINAPI RSAENH_CPEncrypt(HCRYPTPROV hProv, HCRYPTKEY hKey, HCRYPTHASH hHash,
         if (!pbData) return TRUE;
     } else if (GET_ALG_TYPE(pCryptKey->aiAlgid) == ALG_TYPE_STREAM) {
         if (pbData == NULL) {
-            *pdwDataLen = dwBufLen;
+            /* Size query: a stream cipher's ciphertext is the same length as the
+             * plaintext, so the required output size already equals the plaintext
+             * length the caller passed in *pdwDataLen.  Leave it unchanged.  (The
+             * previous code overwrote it with dwBufLen, which is 0 in a pure
+             * size-query call - breaking e.g. SQL Server's login password-encrypt,
+             * which queries the size with dwBufLen==0 and then treats a returned
+             * length of 0 as an encryption failure -> error 17827.) */
             return TRUE;
         }
         encrypt_stream_impl(pCryptKey->aiAlgid, &pCryptKey->context, pbData, *pdwDataLen);
@@ -3211,6 +3220,15 @@ static BOOL import_private_key(HCRYPTPROV hProv, const BYTE *pbData, DWORD dwDat
                                     fStoreKey);
             break;
         }
+        /* Persist the container+key NOW (not only on destroy) so a concurrent
+         * re-acquire of the named container -- e.g. .NET X509Certificate2
+         * get_PrivateKey after PFXImportCertStore -- finds the keyset instead of
+         * NTE_BAD_KEYSET. Mirrors the CPGenKey persistence fix. */
+        if (fStoreKey && !(pKeyContainer->dwFlags & CRYPT_VERIFYCONTEXT))
+        {
+            store_key_container_keys(pKeyContainer);
+            store_key_container_permissions(pKeyContainer);
+        }
     }
     return ret;
 }
@@ -3597,6 +3615,17 @@ BOOL WINAPI RSAENH_CPGenKey(HCRYPTPROV hProv, ALG_ID Algid, DWORD dwFlags, HCRYP
                 release_and_install_key(hProv, *phKey,
                                         &pKeyContainer->hSignatureKeyPair,
                                         FALSE);
+                /* Persist the new key to the container's registry store NOW, not
+                 * only on container destroy. A named (non-VERIFYCONTEXT) container
+                 * that is re-acquired while the generating context is still open
+                 * (e.g. .NET RSACryptoServiceProvider + CspKeyContainerInfo during
+                 * self-signed cert issuance) must see the key, else CryptGetUserkey
+                 * returns NTE_NO_KEY. */
+                if (!(pKeyContainer->dwFlags & CRYPT_VERIFYCONTEXT))
+                {
+                    store_key_container_keys(pKeyContainer);
+                    store_key_container_permissions(pKeyContainer);
+                }
             }
             break;
 
@@ -3609,6 +3638,17 @@ BOOL WINAPI RSAENH_CPGenKey(HCRYPTPROV hProv, ALG_ID Algid, DWORD dwFlags, HCRYP
                 release_and_install_key(hProv, *phKey,
                                         &pKeyContainer->hKeyExchangeKeyPair,
                                         FALSE);
+                /* Persist the new key to the container's registry store NOW, not
+                 * only on container destroy. A named (non-VERIFYCONTEXT) container
+                 * that is re-acquired while the generating context is still open
+                 * (e.g. .NET RSACryptoServiceProvider + CspKeyContainerInfo during
+                 * self-signed cert issuance) must see the key, else CryptGetUserkey
+                 * returns NTE_NO_KEY. */
+                if (!(pKeyContainer->dwFlags & CRYPT_VERIFYCONTEXT))
+                {
+                    store_key_container_keys(pKeyContainer);
+                    store_key_container_permissions(pKeyContainer);
+                }
             }
             break;
             
@@ -4904,7 +4944,7 @@ BOOL WINAPI RSAENH_CPSignHash(HCRYPTPROV hProv, HCRYPTHASH hHash, DWORD dwKeySpe
         return FALSE;
     }
     
-    if (!RSAENH_CPGetUserKey(hProv, dwKeySpec, &hCryptKey)) return FALSE;
+    if (!RSAENH_CPGetUserKey(hProv, dwKeySpec, &hCryptKey)) { MESSAGE("wine_sign_dbg: CPGetUserKey(keyspec=%lu) FAILED err=%lu\n", dwKeySpec, GetLastError()); return FALSE; }
             
     if (!lookup_handle(&handle_table, hCryptKey, RSAENH_MAGIC_KEY,
                        (OBJECTHDR**)&pCryptKey))
@@ -4942,10 +4982,14 @@ BOOL WINAPI RSAENH_CPSignHash(HCRYPTPROV hProv, HCRYPTHASH hHash, DWORD dwKeySpe
  
 
     if (!build_hash_signature(pbSignature, *pdwSigLen, aiAlgid, abHashValue, dwHashLen, dwFlags)) {
+        MESSAGE("wine_sign_dbg: build_hash_signature FAILED aiAlgid=%08x hashlen=%lu\n", aiAlgid, dwHashLen);
         goto out;
     }
 
     ret = encrypt_block_impl(pCryptKey->aiAlgid, PK_PRIVATE, &pCryptKey->context, pbSignature, pbSignature);
+    if (!ret) MESSAGE("wine_sign_dbg: encrypt_block_impl(PK_PRIVATE) FAILED keyAlgid=%08x keyLen=%lu err=%lu\n",
+                      pCryptKey->aiAlgid, pCryptKey->dwKeyLen, GetLastError());
+    else MESSAGE("wine_sign_dbg: SIGN OK keyAlgid=%08x keyLen=%lu\n", pCryptKey->aiAlgid, pCryptKey->dwKeyLen);
 out:
     RSAENH_CPDestroyKey(hProv, hCryptKey);
     return ret;

@@ -268,6 +268,25 @@ BOOL WINAPI LogonUserW( LPCWSTR lpszUsername, LPCWSTR lpszDomain, LPCWSTR lpszPa
     return TRUE;
 }
 
+BOOL WINAPI LogonUserExW( LPCWSTR lpszUsername, LPCWSTR lpszDomain, LPCWSTR lpszPassword,
+                          DWORD dwLogonType, DWORD dwLogonProvider, PHANDLE phToken,
+                          PSID *ppLogonSid, PVOID *ppProfileBuffer, LPDWORD pdwProfileLength,
+                          PQUOTA_LIMITS pQuotaLimits )
+{
+    FIXME("%s %s %p 0x%08lx 0x%08lx %p %p %p %p %p - semi-stub\n", debugstr_w(lpszUsername),
+          debugstr_w(lpszDomain), lpszPassword, dwLogonType, dwLogonProvider, phToken,
+          ppLogonSid, ppProfileBuffer, pdwProfileLength, pQuotaLimits);
+
+    if (!LogonUserW( lpszUsername, lpszDomain, lpszPassword, dwLogonType, dwLogonProvider, phToken ))
+        return FALSE;
+
+    if (ppLogonSid) *ppLogonSid = NULL;
+    if (ppProfileBuffer) *ppProfileBuffer = NULL;
+    if (pdwProfileLength) *pdwProfileLength = 0;
+    if (pQuotaLimits) memset( pQuotaLimits, 0, sizeof(*pQuotaLimits) );
+    return TRUE;
+}
+
 typedef UINT (WINAPI *fnMsiProvideComponentFromDescriptor)(LPCWSTR,LPWSTR,DWORD*,DWORD*);
 
 DWORD WINAPI CommandLineFromMsiDescriptor( WCHAR *szDescriptor,

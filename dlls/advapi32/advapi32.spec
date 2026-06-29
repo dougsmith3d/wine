@@ -425,7 +425,7 @@
 @ stdcall LogonUserA(str str str long long ptr)
 # @ stub LogonUserExA
 # @ stub LogonUserExExW
-# @ stub LogonUserExW
+@ stdcall LogonUserExW(wstr wstr wstr long long ptr ptr ptr ptr ptr)
 @ stdcall LogonUserW(wstr wstr wstr long long ptr)
 @ stdcall LookupAccountNameA(str str ptr ptr ptr ptr ptr)
 @ stdcall LookupAccountNameW(wstr wstr ptr ptr ptr ptr ptr)
@@ -568,7 +568,7 @@
 @ stdcall PerfQueryCounterData(long ptr long ptr)
 # @ stub PerfQueryCounterInfo
 # @ stub PerfQueryCounterSetRegistrationInfo
-# @ stub PerfQueryInstance
+@ stdcall -import PerfQueryInstance(long ptr wstr long)
 # @ stub PerfRegCloseKey
 # @ stub PerfRegEnumKey
 # @ stub PerfRegEnumValue

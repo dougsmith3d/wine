@@ -5883,6 +5883,36 @@ NTSTATUS WINAPI RtlQueryInformationActiveActivationContext( ULONG class, PVOID b
                                                  class, buffer, buffer_size, return_length );
 }
 
+
+/* Wine SQL-under-Wine fix (R6034): the VC++ CRT (msvcrNN/msvcpNN/msvcmNN) declares
+ * itself as an SxS assembly dependency; when Wine fails to register it in any
+ * activation-context section but the DLL is genuinely loaded, the genuine MS CRT
+ * startup self-check fires a modal R6034 ("loaded the C runtime library incorrectly")
+ * which deadlocks headless silent installs. Treat an actually-loaded VC CRT DLL as a
+ * found DLL-redirection entry so the self-check passes (as it does on Windows). */
+static BOOL is_loaded_vc_crt_dll( const UNICODE_STRING *name )
+{
+    static const WCHAR *const prefixes[] = { L"msvcr", L"msvcp", L"msvcm" };
+    const WCHAR *buf = name->Buffer;
+    ULONG len = name->Length / sizeof(WCHAR);
+    unsigned int i;
+
+    if (len < 8 || len > 16) return FALSE;            /* msvcrNN.dll .. msvcr140.dll */
+    /* must end in .dll */
+    if (wcsnicmp( buf + len - 4, L".dll", 4 )) return FALSE;
+    /* NB: do NOT call LdrGetDllHandle here -- this runs inside LdrLoadDll while the
+     * loader lock may be held; acquiring it again deadlocks. A name-pattern match is
+     * sufficient: this lookup for these exact CRT names only comes from the CRT's own
+     * R6034 self-check. */
+    for (i = 0; i < ARRAY_SIZE(prefixes); i++)
+    {
+        size_t pl = wcslen( prefixes[i] );
+        if (!wcsnicmp( buf, prefixes[i], pl ) && buf[pl] >= '0' && buf[pl] <= '9')
+            return TRUE;
+    }
+    return FALSE;
+}
+
 /***********************************************************************
  *		RtlFindActivationContextSectionString (NTDLL.@)
  *
@@ -5921,6 +5951,29 @@ NTSTATUS WINAPI RtlFindActivationContextSectionString( ULONG flags, const GUID *
 
     if (status != STATUS_SUCCESS)
         status = find_string( process_actctx, section_kind, section_name, flags, data );
+
+    if (status != STATUS_SUCCESS &&
+        flags == 0 &&
+        section_kind == ACTIVATION_CONTEXT_SECTION_DLL_REDIRECTION &&
+        is_loaded_vc_crt_dll( section_name ))
+    {
+        WARN( "synthesizing SxS DLL-redirection hit for loaded VC CRT %s (R6034 workaround)\n",
+              debugstr_us(section_name) );
+        if (data)
+        {
+            data->ulDataFormatVersion = 1;
+            data->lpData = NULL;
+            data->ulLength = 0;
+            data->lpSectionGlobalData = NULL;
+            data->ulSectionGlobalDataLength = 0;
+            data->lpSectionBase = NULL;
+            data->ulSectionTotalLength = 0;
+            data->hActCtx = NULL;
+            if (data->cbSize >= FIELD_OFFSET(ACTCTX_SECTION_KEYED_DATA, ulAssemblyRosterIndex) + sizeof(ULONG))
+                data->ulAssemblyRosterIndex = 0;
+        }
+        status = STATUS_SUCCESS;
+    }
 
     return status;
 }

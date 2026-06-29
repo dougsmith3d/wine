@@ -30,9 +30,84 @@
 #include "winbase.h"
 #include "winreg.h"
 #include "winsvc.h"
+#include "winnt.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(svchost);
+
+/* Some shared-process services (notably modern MS service DLLs hosted via
+ * svchost, e.g. SQL Server's AzureAttestService) export the undocumented
+ * SvchostPushServiceGlobals entry point and *require* it to be called before
+ * their ServiceMain runs: ServiceMain dereferences the pushed SVCHOST_GLOBAL_DATA
+ * pointer, so a missing call is an immediate NULL-deref crash that aborts the
+ * service start (and any installer custom action that starts the service).
+ *
+ * The structure is undocumented but stable: a leading block of well-known SID
+ * pointers followed by a block of RPC helper function pointers.  We build a
+ * conservative instance once (well-known SIDs filled in, every function-pointer
+ * slot pointed at a benign stub) and hand it to the service.  This is enough for
+ * the service to read any field or call any helper without faulting. */
+
+static DWORD WINAPI svchost_globals_stub(void)
+{
+    /* generic benign helper: claim success (RPC_S_OK == 0) for any RPC helper
+     * the hosted service may invoke through the globals table. */
+    return 0;
+}
+
+#define SVCHOST_GLOBALS_SLOTS 64          /* 512 bytes; covers all known fields */
+#define SVCHOST_GLOBALS_SID_SLOTS 18      /* leading well-known SID pointers     */
+
+static void *build_svchost_globals(void)
+{
+    static void *globals[SVCHOST_GLOBALS_SLOTS];
+    static BOOL built;
+    struct { SID_IDENTIFIER_AUTHORITY auth; DWORD count; DWORD sub[2]; } sids[] = {
+        {{SECURITY_NULL_SID_AUTHORITY},   1, {SECURITY_NULL_RID, 0}},
+        {{SECURITY_WORLD_SID_AUTHORITY},  1, {SECURITY_WORLD_RID, 0}},
+        {{SECURITY_LOCAL_SID_AUTHORITY},  1, {SECURITY_LOCAL_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         1, {SECURITY_NETWORK_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         1, {SECURITY_LOCAL_SYSTEM_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         1, {SECURITY_LOCAL_SERVICE_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         1, {SECURITY_NETWORK_SERVICE_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         1, {SECURITY_BUILTIN_DOMAIN_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         1, {SECURITY_AUTHENTICATED_USER_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         1, {SECURITY_ANONYMOUS_LOGON_RID, 0}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_USERS}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_GUESTS}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_POWER_USERS}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ACCOUNT_OPS}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_SYSTEM_OPS}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_PRINT_OPS}},
+        {{SECURITY_NT_AUTHORITY},         2, {SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_BACKUP_OPS}},
+    };
+    unsigned int i;
+
+    if (built) return globals;
+
+    /* every slot defaults to the benign stub so any unexpected field that is
+     * read as (and called through) a function pointer cannot fault. */
+    for (i = 0; i < SVCHOST_GLOBALS_SLOTS; i++)
+        globals[i] = svchost_globals_stub;
+
+    /* fill the leading well-known SID pointers. */
+    for (i = 0; i < SVCHOST_GLOBALS_SID_SLOTS && i < ARRAY_SIZE(sids); i++)
+    {
+        PSID sid = NULL;
+        if (AllocateAndInitializeSid(&sids[i].auth, (BYTE)sids[i].count,
+                sids[i].sub[0], sids[i].sub[1], 0, 0, 0, 0, 0, 0, &sid) && sid)
+            globals[i] = sid;
+    }
+
+    built = TRUE;
+    return globals;
+}
+
+/* prototype matching the hosted DLL's expectation: the globals pointer is taken
+ * from the second integer-register argument. We pass it in both so we satisfy
+ * either calling shape. */
+typedef void (WINAPI *SvchostPushServiceGlobals_t)(void *reserved, void *globals);
 
 static const WCHAR service_reg_path[] = L"System\\CurrentControlSet\\Services";
 static const WCHAR svchost_path[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Svchost";
@@ -204,10 +279,16 @@ static BOOL AddServiceElem(LPWSTR service_name,
         goto cleanup;
     }
 
-    if (GetProcAddress(library, "SvchostPushServiceGlobals"))
     {
-        WINE_FIXME("library %s expects undocumented SvchostPushServiceGlobals function to be called\n",
-                   wine_dbgstr_w(dll_name_long));
+        SvchostPushServiceGlobals_t push_globals =
+            (SvchostPushServiceGlobals_t)GetProcAddress(library, "SvchostPushServiceGlobals");
+        if (push_globals)
+        {
+            void *globals = build_svchost_globals();
+            WINE_TRACE("calling SvchostPushServiceGlobals for %s with globals %p\n",
+                       wine_dbgstr_w(dll_name_long), globals);
+            push_globals(globals, globals);
+        }
     }
 
     /* Fill in the service table entry */

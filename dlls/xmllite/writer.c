@@ -943,6 +943,11 @@ static HRESULT WINAPI xmlwriter_SetProperty(IXmlWriter *iface, UINT property, LO
 
     switch (property)
     {
+        case XmlWriterProperty_MultiLanguage:
+            /* Accept and ignore, matching the reader (which logs "Ignoring MultiLanguage").
+             * IIS nativerd sets this when serializing applicationHost.config via IXmlWriter;
+             * returning E_NOTIMPL here makes WritableAdminManager::CommitChanges fail. */
+            break;
         case XmlWriterProperty_Indent:
             writer->indent = !!value;
             break;
@@ -2241,6 +2246,13 @@ static HRESULT WINAPI xmlwriter_WriteWhitespace(IXmlWriter *iface, LPCWSTR text)
     case XmlWriterState_InvalidEncoding:
         return MX_E_ENCODING;
     case XmlWriterState_Ready:
+    case XmlWriterState_DocStarted:
+    case XmlWriterState_PIDocStarted:
+    case XmlWriterState_Content:
+        /* whitespace is valid in the prolog (after the XML declaration / a PI, before the
+         * root element) and in content between elements. Wine only allowed Ready, so a
+         * WriteWhitespace right after WriteStartDocument failed WR_E_INVALIDACTION -- which
+         * is exactly what IIS nativerd does when serializing applicationHost.config. */
         break;
     default:
         return WR_E_INVALIDACTION;

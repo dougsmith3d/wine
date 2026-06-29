@@ -51,8 +51,14 @@ struct object_property
     void *value;
 };
 
+/* Tags a genuine ncrypt object so NCryptIsKeyHandle can distinguish it from a
+ * legacy HCRYPTPROV -- both are heap pointers under Wine, so a magnitude test
+ * (the old crypt32 heuristic) cannot tell them apart. */
+#define NCRYPT_OBJECT_MAGIC 0x6e637279 /* 'ncry' */
+
 struct object
 {
+    DWORD magic;
     enum object_type type;
     DWORD num_properties;
     struct object_property *properties;

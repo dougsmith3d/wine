@@ -205,6 +205,7 @@ typedef struct
     IDispatch IDispatch_iface;
     void * pvThis;
     ITypeInfo * pTypeInfo;
+    IUnknown * punkOuter;  /* controlling unknown: delegate non-IDispatch QIs here */
     LONG ref;
 } StdDispatch;
 
@@ -235,6 +236,11 @@ static HRESULT WINAPI StdDispatch_QueryInterface(
         IDispatch_AddRef(iface);
         return S_OK;
     }
+    /* A dual interface implemented over CreateStdDispatch passes the real object as
+     * punkOuter; delegate any other interface (e.g. the dual vtable IID) to it so a
+     * caller that received this dispatch can QI back to the strongly-typed interface. */
+    if (This->punkOuter)
+        return IUnknown_QueryInterface(This->punkOuter, riid, ppvObject);
     return E_NOINTERFACE;
 }
 
@@ -432,7 +438,8 @@ static const IDispatchVtbl StdDispatch_VTable =
  *  Failure: An HRESULT error code.
  *
  * NOTES
- *  Outer unknown appears to be completely ignored.
+ *  The outer unknown receives delegated QueryInterface calls for interfaces
+ *  other than IDispatch/IUnknown (so dual interfaces built on this resolve).
  */
 HRESULT WINAPI CreateStdDispatch(
         IUnknown* punkOuter,
@@ -454,6 +461,7 @@ HRESULT WINAPI CreateStdDispatch(
     pStdDispatch->IDispatch_iface.lpVtbl = &StdDispatch_VTable;
     pStdDispatch->pvThis = pvThis;
     pStdDispatch->pTypeInfo = ptinfo;
+    pStdDispatch->punkOuter = punkOuter;
     pStdDispatch->ref = 1;
 
     /* we keep a reference to the type info so prevent it from

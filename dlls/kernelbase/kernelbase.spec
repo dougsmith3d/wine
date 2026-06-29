@@ -1193,7 +1193,7 @@
 @ stdcall PerfDeleteInstance(long ptr)
 # @ stub PerfIncrementULongCounterValue
 # @ stub PerfIncrementULongLongCounterValue
-# @ stub PerfQueryInstance
+@ stdcall PerfQueryInstance(long ptr wstr long)
 @ stdcall PerfSetCounterRefValue(long ptr long ptr)
 @ stdcall PerfSetCounterSetInfo(long ptr long)
 @ stdcall PerfSetULongCounterValue(long ptr long long)
@@ -1734,7 +1734,7 @@
 @ stdcall VirtualQuery(ptr ptr long)
 @ stdcall VirtualQueryEx(long ptr ptr long)
 @ stdcall VirtualUnlock(ptr long)
-# @ stub WTSGetServiceSessionId
+@ stdcall WTSGetServiceSessionId() WTSGetServiceSessionId
 # @ stub WTSIsServerContainer
 @ stdcall WaitCommEvent(long ptr ptr)
 @ stdcall WaitForDebugEvent(ptr long)

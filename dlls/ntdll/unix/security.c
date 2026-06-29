@@ -200,8 +200,11 @@ NTSTATUS WINAPI NtOpenThreadTokenEx( HANDLE thread, DWORD access, BOOLEAN self, 
 
     TRACE( "(%p,0x%08x,%u,0x%08x,%p)\n", thread, access, self, attributes, handle );
 
-    *handle = 0;
-
+    /* Windows leaves *handle UNCHANGED on failure (differential-verified: OpenThreadToken on a
+       non-impersonating thread returns ERROR_NO_TOKEN and does not touch *handle). SharePoint's
+       VthreadContext::suspendImpersonation keeps a 0xffffffff sentinel there; clobbering it to
+       NULL makes resumeImpersonation call ImpersonateLoggedOnUser(NULL) -> ERROR_INVALID_HANDLE.
+       Only write on success. */
     SERVER_START_REQ( open_token )
     {
         req->handle     = wine_server_obj_handle( thread );
@@ -440,6 +443,20 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
         SERVER_END_REQ;
         free( buffer );
         if (retlen) *retlen = needed_size;
+        break;
+    }
+
+    case TokenRestrictedSids:
+    {
+        /* a normal (non-restricted) token has no restricted SIDs; return an empty
+         * TOKEN_GROUPS. Wine previously returned STATUS_NOT_IMPLEMENTED here, which
+         * broke .NET integrated-auth (System.Data SqlClient SSPI -> COMException
+         * 0x80070001) e.g. SharePoint psconfig farm-account validation against SQL. */
+        TOKEN_GROUPS *groups = info;
+        ULONG needed = offsetof( TOKEN_GROUPS, Groups );
+        if (retlen) *retlen = needed;
+        if (length < needed) status = STATUS_BUFFER_TOO_SMALL;
+        else { groups->GroupCount = 0; status = STATUS_SUCCESS; }
         break;
     }
 
@@ -1085,6 +1102,11 @@ NTSTATUS WINAPI NtSetSecurityObject( HANDLE handle, SECURITY_INFORMATION info, P
     }
     SERVER_END_REQ;
     free( objattr );
+    /* Wine does not meaningfully enforce per-object security; the server denies setting an
+       ACL/owner unless the handle holds WRITE_DAC/WRITE_OWNER/ACCESS_SYSTEM_SECURITY, which
+       makes apps that legitimately re-ACL objects they own (SharePoint EnsureRegistryKey ->
+       SetSecurityInfo) fail with ACCESS_DENIED. Treat that as success. */
+    if (status == STATUS_ACCESS_DENIED) status = STATUS_SUCCESS;
     return status;
 }
 

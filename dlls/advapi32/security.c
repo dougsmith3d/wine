@@ -977,6 +977,28 @@ LookupAccountSidW(
 
     free(account_name);
     free(computer_name);
+    /* Synthesize a name for any SID Wine can't map (reverse of lookup_synthesized_local_name),
+       returning the SID string itself. Without this, .NET SecurityIdentifier.Translate(NTAccount)
+       fails and building an IPC-channel security descriptor throws IdentityNotMappedException --
+       which is exactly what SharePoint's admin service (WSSADMIN) OnStart does. */
+    {
+        WCHAR *sidstr = NULL;
+        if (ConvertSidToStringSidW( sid, &sidstr ) && sidstr)
+        {
+            DWORD ac_len = lstrlenW(sidstr) + 1, dm_len = 1;
+            BOOL status = TRUE;
+            if ((*accountSize && *accountSize < ac_len) || (!account && !*accountSize && ac_len) ||
+                (*domainSize && *domainSize < dm_len)   || (!domain && !*domainSize && dm_len))
+            { SetLastError(ERROR_INSUFFICIENT_BUFFER); status = FALSE; }
+            if (status) { if (account) lstrcpyW(account, sidstr); if (domain) domain[0] = 0; }
+            *domainSize  = *domainSize  ? dm_len : dm_len + 1;
+            *accountSize = *accountSize ? ac_len : ac_len + 1;
+            MESSAGE( "wine_lsa_dbg: LookupAccountSidW SYNTH name=%s status=%d\n", debugstr_w(sidstr), status );
+            LocalFree(sidstr);
+            if (status) *name_use = SidTypeAlias;
+            return status;
+        }
+    }
     SetLastError(ERROR_NONE_MAPPED);
     return FALSE;
 }
@@ -1375,6 +1397,61 @@ BOOL lookup_local_user_name( const LSA_UNICODE_STRING *account_and_domain,
 /******************************************************************************
  * LookupAccountNameW [ADVAPI32.@]
  */
+/******************************************************************************
+ * lookup_local_synthesized_name
+ *
+ * Wine has no local-group SAM (NetLocalGroupAdd is a stub), so SharePoint's
+ * WSS_WPG / WSS_ADMIN_WPG groups and NT SERVICE\\* virtual accounts never resolve.
+ * Synthesize a deterministic local SID so name->SID succeeds; the caller only
+ * stores it in a security descriptor (service ACLs), it is never authenticated.
+ */
+static BOOL lookup_local_synthesized_name( const LSA_UNICODE_STRING *account, PSID Sid, PDWORD cbSid,
+                                           LPWSTR ReferencedDomainName, LPDWORD cchReferencedDomainName,
+                                           PSID_NAME_USE peUse, BOOL *handled )
+{
+    SID_IDENTIFIER_AUTHORITY nt = { { 0,0,0,0,0,5 } };
+    const WCHAR *p = account->Buffer;
+    DWORD n = account->Length / sizeof(WCHAR);
+    DWORD i, rid = 0x4000, len, nameLen;
+    WCHAR domainName[MAX_COMPUTERNAME_LENGTH + 1];
+    BOOL ret = TRUE, is_service = FALSE;
+    PSID pSid = NULL;
+
+    *handled = TRUE;
+    for (i = 0; i < n; i++) { WCHAR c = p[i]; if (c >= 'a' && c <= 'z') c -= 32; rid = rid * 131 + c; }
+    rid = (rid & 0x3fffffff) | 0x1000;
+
+    if (n >= 11)
+    {
+        static const WCHAR svc[] = {'N','T',' ','S','E','R','V','I','C','E','\\'};
+        is_service = TRUE;
+        for (i = 0; i < 11; i++) { WCHAR a = p[i]; if (a >= 'a' && a <= 'z') a -= 32; if (a != svc[i]) { is_service = FALSE; break; } }
+    }
+
+    if (is_service)
+        RtlAllocateAndInitializeSid( &nt, 6, 80, rid, 0x5350, 0, 0, 0, 0, 0, &pSid );
+    else
+        RtlAllocateAndInitializeSid( &nt, 5, 21, 0x53504e54, 0x57494e45, rid, 0, 0, 0, 0, &pSid );
+    if (!pSid) { *handled = FALSE; return FALSE; }
+
+    MESSAGE( "wine_lan_dbg: synthesized local SID for %s (rid=%#lx svc=%d)\n", debugstr_w(account->Buffer), rid, is_service );
+
+    len = GetLengthSid( pSid );
+    if (Sid && *cbSid >= len) CopySid( *cbSid, Sid, pSid );
+    if (*cbSid < len) { SetLastError( ERROR_INSUFFICIENT_BUFFER ); ret = FALSE; }
+    *cbSid = len;
+
+    nameLen = MAX_COMPUTERNAME_LENGTH + 1;
+    if (!GetComputerNameW( domainName, &nameLen )) { domainName[0] = 0; nameLen = 0; }
+    if (*cchReferencedDomainName <= nameLen || !ret) { SetLastError( ERROR_INSUFFICIENT_BUFFER ); nameLen += 1; ret = FALSE; }
+    else if (ReferencedDomainName) lstrcpyW( ReferencedDomainName, domainName );
+    *cchReferencedDomainName = nameLen;
+
+    if (ret) *peUse = is_service ? SidTypeWellKnownGroup : SidTypeAlias;
+    FreeSid( pSid );
+    return ret;
+}
+
 BOOL WINAPI LookupAccountNameW( LPCWSTR lpSystemName, LPCWSTR lpAccountName, PSID Sid,
                                 LPDWORD cbSid, LPWSTR ReferencedDomainName,
                                 LPDWORD cchReferencedDomainName, PSID_NAME_USE peUse )
@@ -1411,6 +1488,12 @@ BOOL WINAPI LookupAccountNameW( LPCWSTR lpSystemName, LPCWSTR lpAccountName, PSI
     if (handled)
         return ret;
 
+    ret = lookup_local_synthesized_name( &account, Sid, cbSid, ReferencedDomainName,
+                                         cchReferencedDomainName, peUse, &handled );
+    if (handled)
+        return ret;
+
+    MESSAGE( "wine_lan_dbg: LookupAccountNameW NONE_MAPPED for %s\n", debugstr_w(lpAccountName) );
     SetLastError( ERROR_NONE_MAPPED );
     return FALSE;
 }

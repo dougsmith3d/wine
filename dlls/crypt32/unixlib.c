@@ -34,6 +34,7 @@
 #endif
 #ifdef SONAME_LIBGNUTLS
 #include <gnutls/pkcs12.h>
+#include <gnutls/x509.h>
 #endif
 
 #include "ntstatus.h"
@@ -73,6 +74,21 @@ MAKE_FUNCPTR(gnutls_pkcs12_simple_parse);
 MAKE_FUNCPTR(gnutls_x509_crt_export);
 MAKE_FUNCPTR(gnutls_x509_privkey_export_rsa_raw2);
 MAKE_FUNCPTR(gnutls_x509_privkey_get_pk_algorithm2);
+MAKE_FUNCPTR(gnutls_x509_crt_init);
+MAKE_FUNCPTR(gnutls_x509_crt_import);
+MAKE_FUNCPTR(gnutls_x509_crt_deinit);
+MAKE_FUNCPTR(gnutls_x509_privkey_init);
+MAKE_FUNCPTR(gnutls_x509_privkey_deinit);
+MAKE_FUNCPTR(gnutls_x509_privkey_import_rsa_raw);
+MAKE_FUNCPTR(gnutls_x509_privkey_export2_pkcs8);
+MAKE_FUNCPTR(gnutls_pkcs12_set_bag);
+MAKE_FUNCPTR(gnutls_pkcs12_generate_mac);
+MAKE_FUNCPTR(gnutls_pkcs12_export);
+MAKE_FUNCPTR(gnutls_pkcs12_bag_init);
+MAKE_FUNCPTR(gnutls_pkcs12_bag_deinit);
+MAKE_FUNCPTR(gnutls_pkcs12_bag_set_crt);
+MAKE_FUNCPTR(gnutls_pkcs12_bag_set_data);
+MAKE_FUNCPTR(gnutls_pkcs12_bag_encrypt);
 #undef MAKE_FUNCPTR
 
 static void gnutls_log( int level, const char *msg )
@@ -120,6 +136,21 @@ static NTSTATUS process_attach( void *args )
     LOAD_FUNCPTR(gnutls_x509_crt_export)
     LOAD_FUNCPTR(gnutls_x509_privkey_export_rsa_raw2)
     LOAD_FUNCPTR(gnutls_x509_privkey_get_pk_algorithm2)
+    LOAD_FUNCPTR(gnutls_x509_crt_init)
+    LOAD_FUNCPTR(gnutls_x509_crt_import)
+    LOAD_FUNCPTR(gnutls_x509_crt_deinit)
+    LOAD_FUNCPTR(gnutls_x509_privkey_init)
+    LOAD_FUNCPTR(gnutls_x509_privkey_deinit)
+    LOAD_FUNCPTR(gnutls_x509_privkey_import_rsa_raw)
+    LOAD_FUNCPTR(gnutls_x509_privkey_export2_pkcs8)
+    LOAD_FUNCPTR(gnutls_pkcs12_set_bag)
+    LOAD_FUNCPTR(gnutls_pkcs12_generate_mac)
+    LOAD_FUNCPTR(gnutls_pkcs12_export)
+    LOAD_FUNCPTR(gnutls_pkcs12_bag_init)
+    LOAD_FUNCPTR(gnutls_pkcs12_bag_deinit)
+    LOAD_FUNCPTR(gnutls_pkcs12_bag_set_crt)
+    LOAD_FUNCPTR(gnutls_pkcs12_bag_set_data)
+    LOAD_FUNCPTR(gnutls_pkcs12_bag_encrypt)
 #undef LOAD_FUNCPTR
 
     if ((ret = pgnutls_global_init()) != GNUTLS_E_SUCCESS)
@@ -294,7 +325,7 @@ static NTSTATUS open_cert_store( void *args )
     pfx_data.size = params->pfx->cbData;
     if ((ret = pgnutls_pkcs12_import( p12, &pfx_data, GNUTLS_X509_FMT_DER, 0 )) < 0) goto error;
 
-    if ((ret = pgnutls_pkcs12_simple_parse( p12, pwd ? pwd : "", &key, &chain, &chain_len, NULL, NULL, NULL, 0 )) < 0)
+    if ((ret = pgnutls_pkcs12_simple_parse( p12, pwd ? pwd : "", &key, &chain, &chain_len, NULL, NULL, NULL, GNUTLS_PKCS12_SP_INCLUDE_SELF_SIGNED )) < 0)
         goto error;
 
     if ((ret = pgnutls_x509_privkey_get_pk_algorithm2( key, &bitlen )) < 0)
@@ -691,6 +722,111 @@ static NTSTATUS enum_root_certs( void *args )
     return STATUS_SUCCESS;
 }
 
+
+/* Reverse-copy a little-endian field (MS key blob) into a big-endian buffer (gnutls). */
+static void le_to_be( BYTE *dst, const BYTE *src, unsigned int n )
+{
+    unsigned int i;
+    for (i = 0; i < n; i++) dst[i] = src[n - 1 - i];
+}
+
+static NTSTATUS export_cert_store( void *args )
+{
+    struct export_cert_store_params *params = args;
+    gnutls_x509_crt_t crt = NULL;
+    gnutls_x509_privkey_t key = NULL;
+    gnutls_pkcs12_t p12 = NULL;
+    gnutls_pkcs12_bag_t cbag = NULL, kbag = NULL;
+    gnutls_datum_t cert_datum, pkcs8 = { NULL, 0 };
+    gnutls_datum_t m = {0}, e = {0}, d = {0}, p = {0}, q = {0}, u = {0};
+    BYTE ebuf[4];
+    char *pwd = NULL;
+    const char *pass;
+    NTSTATUS status = STATUS_INVALID_PARAMETER;
+    int ret = 0;
+    size_t size = 0;
+
+    if (!libgnutls_handle) return STATUS_DLL_NOT_FOUND;
+    if (params->password && !(pwd = password_to_ascii( params->password ))) return STATUS_NO_MEMORY;
+    pass = pwd ? pwd : "";
+
+    if ((ret = pgnutls_x509_crt_init( &crt )) < 0) goto done;
+    cert_datum.data = (unsigned char *)params->cert;
+    cert_datum.size = params->cert_size;
+    if ((ret = pgnutls_x509_crt_import( crt, &cert_datum, GNUTLS_X509_FMT_DER )) < 0) goto done;
+
+    if (params->key_blob && params->key_blob_size >= sizeof(BLOBHEADER) + sizeof(RSAPUBKEY))
+    {
+        RSAPUBKEY *rsakey = (RSAPUBKEY *)((BLOBHEADER *)params->key_blob + 1);
+        unsigned int bitlen = rsakey->bitlen;
+        BYTE *ptr = (BYTE *)(rsakey + 1);
+        DWORD pe = rsakey->pubexp;
+        unsigned int off;
+
+        m.size = bitlen / 8;  m.data = malloc( m.size ); le_to_be( m.data, ptr, m.size ); ptr += m.size;
+        p.size = bitlen / 16; p.data = malloc( p.size ); le_to_be( p.data, ptr, p.size ); ptr += p.size;
+        q.size = bitlen / 16; q.data = malloc( q.size ); le_to_be( q.data, ptr, q.size ); ptr += q.size;
+        ptr += bitlen / 16; /* skip exponent1 (dp) */
+        ptr += bitlen / 16; /* skip exponent2 (dq) */
+        u.size = bitlen / 16; u.data = malloc( u.size ); le_to_be( u.data, ptr, u.size ); ptr += u.size;
+        d.size = bitlen / 8;  d.data = malloc( d.size ); le_to_be( d.data, ptr, d.size ); ptr += d.size;
+
+        ebuf[0] = pe >> 24; ebuf[1] = pe >> 16; ebuf[2] = pe >> 8; ebuf[3] = pe;
+        off = 0; while (off < 3 && !ebuf[off]) off++;
+        e.data = ebuf + off; e.size = 4 - off;
+
+        if ((ret = pgnutls_x509_privkey_init( &key )) < 0) goto done;
+        ret = pgnutls_x509_privkey_import_rsa_raw( key, &m, &e, &d, &p, &q, &u );
+        if (ret < 0) goto done;
+    }
+
+    if ((ret = pgnutls_pkcs12_init( &p12 )) < 0) goto done;
+
+    if ((ret = pgnutls_pkcs12_bag_init( &cbag )) < 0) goto done;
+    if ((ret = pgnutls_pkcs12_bag_set_crt( cbag, crt )) < 0) goto done;
+    if (*pass) pgnutls_pkcs12_bag_encrypt( cbag, pass, GNUTLS_PKCS_USE_PKCS12_3DES );
+    if ((ret = pgnutls_pkcs12_set_bag( p12, cbag )) < 0) goto done;
+    cbag = NULL; /* owned by p12 */
+
+    if (key)
+    {
+        if ((ret = pgnutls_x509_privkey_export2_pkcs8( key, GNUTLS_X509_FMT_DER, NULL,
+                                                       GNUTLS_PKCS_PLAIN, &pkcs8 )) < 0) goto done;
+        if ((ret = pgnutls_pkcs12_bag_init( &kbag )) < 0) goto done;
+        if ((ret = pgnutls_pkcs12_bag_set_data( kbag, GNUTLS_BAG_PKCS8_KEY, &pkcs8 )) < 0) goto done;
+        if (*pass && (ret = pgnutls_pkcs12_bag_encrypt( kbag, pass, GNUTLS_PKCS_USE_PKCS12_3DES )) < 0) goto done;
+        if ((ret = pgnutls_pkcs12_set_bag( p12, kbag )) < 0) goto done;
+        kbag = NULL; /* owned by p12 */
+    }
+
+    if ((ret = pgnutls_pkcs12_generate_mac( p12, pass )) < 0) goto done;
+
+    ret = pgnutls_pkcs12_export( p12, GNUTLS_X509_FMT_DER, NULL, &size );
+    if (ret < 0 && ret != GNUTLS_E_SHORT_MEMORY_BUFFER) goto done;
+    if (!params->buf || *params->buf_size < size)
+    {
+        *params->buf_size = size;
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto done;
+    }
+    if ((ret = pgnutls_pkcs12_export( p12, GNUTLS_X509_FMT_DER, params->buf, &size )) < 0) goto done;
+    *params->buf_size = size;
+    status = STATUS_SUCCESS;
+    ret = 0;
+
+done:
+    if (ret < 0) pgnutls_perror( ret );
+    free( m.data ); free( p.data ); free( q.data ); free( u.data ); free( d.data );
+    if (pkcs8.data) free( pkcs8.data );
+    if (kbag) pgnutls_pkcs12_bag_deinit( kbag );
+    if (cbag) pgnutls_pkcs12_bag_deinit( cbag );
+    if (p12) pgnutls_pkcs12_deinit( p12 );
+    if (key) pgnutls_x509_privkey_deinit( key );
+    if (crt) pgnutls_x509_crt_deinit( crt );
+    free( pwd );
+    return status;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     process_attach,
@@ -700,6 +836,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     import_store_cert,
     close_cert_store,
     enum_root_certs,
+    export_cert_store,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
@@ -794,6 +931,33 @@ static NTSTATUS wow64_enum_root_certs( void *args )
     return enum_root_certs( &params );
 }
 
+static NTSTATUS wow64_export_cert_store( void *args )
+{
+    struct
+    {
+        PTR32 cert;
+        DWORD cert_size;
+        PTR32 key_blob;
+        DWORD key_blob_size;
+        PTR32 password;
+        PTR32 buf;
+        PTR32 buf_size;
+    } const *params32 = args;
+
+    struct export_cert_store_params params =
+    {
+        ULongToPtr( params32->cert ),
+        params32->cert_size,
+        ULongToPtr( params32->key_blob ),
+        params32->key_blob_size,
+        ULongToPtr( params32->password ),
+        ULongToPtr( params32->buf ),
+        ULongToPtr( params32->buf_size )
+    };
+
+    return export_cert_store( &params );
+}
+
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     process_attach,
@@ -803,6 +967,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     wow64_import_store_cert,
     close_cert_store,
     wow64_enum_root_certs,
+    wow64_export_cert_store,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );

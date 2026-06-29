@@ -50,6 +50,15 @@ BOOL cng_prepare_signature(const char *alg_oid, BYTE *encoded_sig, DWORD encoded
  */
 void CRYPT_CopyReversed(BYTE *dst, const BYTE *src, size_t len);
 
+/* Legacy CryptoAPI (rsaenh) provider/key handles are small table indices,
+ * whereas CNG NCRYPT key handles are heap-allocated object pointers. Use the
+ * magnitude to tell a CNG NCRYPT_KEY_HANDLE from a legacy HCRYPTPROV so the
+ * self-sign cert path (CryptExportPublicKeyInfo/CryptSignCertificate) can route
+ * a CNG key through NCrypt instead of the legacy CSP API. */
+/* Legacy HCRYPTPROV vs CNG NCRYPT_KEY_HANDLE: both are heap pointers under Wine,
+ * so ask ncrypt directly (NCryptIsKeyHandle) instead of guessing by magnitude. */
+BOOL CRYPT_IsCNGKeyHandle(ULONG_PTR handle);
+
 BOOL CRYPT_EncodeLen(DWORD len, BYTE *pbEncoded, DWORD *pcbEncoded);
 
 typedef BOOL (WINAPI *CryptEncodeObjectExFunc)(DWORD, LPCSTR, const void *,
@@ -505,6 +514,17 @@ struct close_cert_store_params
     cert_store_data_t data;
 };
 
+struct export_cert_store_params
+{
+    const BYTE  *cert;          /* cert DER */
+    DWORD        cert_size;
+    const BYTE  *key_blob;      /* RSA PRIVATEKEYBLOB, or NULL for cert-only */
+    DWORD        key_blob_size;
+    const WCHAR *password;
+    void        *buf;           /* out: PKCS#12 DER (NULL => size query) */
+    DWORD       *buf_size;
+};
+
 struct enum_root_certs_params
 {
     void  *buffer;
@@ -521,6 +541,7 @@ enum unix_funcs
     unix_import_store_cert,
     unix_close_cert_store,
     unix_enum_root_certs,
+    unix_export_cert_store,
     unix_funcs_count,
 };
 

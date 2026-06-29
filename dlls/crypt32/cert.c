@@ -29,6 +29,7 @@
 #include "wincrypt.h"
 #include "snmp.h"
 #include "bcrypt.h"
+#include "ncrypt.h"
 #include "winnls.h"
 #include "rpc.h"
 #include "wine/debug.h"
@@ -906,11 +907,23 @@ static BOOL CRYPT_AcquirePrivateKeyFromProvInfo(PCCERT_CONTEXT pCert, DWORD dwFl
     }
     if (ret)
     {
-        ret = CryptAcquireContextW(phCryptProv, info->pwszContainerName, info->pwszProvName, info->dwProvType, flags);
+        LPWSTR provName = info->pwszProvName;
+        DWORD provType = info->dwProvType;
+
+        /* A CNG (NCRYPT) key prov info uses dwProvType 0 and a Key Storage
+         * Provider name the legacy CSP API cannot open. Wine's ncrypt mirrors
+         * such persisted keys into rsaenh's legacy container, so acquire them
+         * through the default legacy RSA provider by container name. */
+        if (!provType)
+        {
+            provName = NULL;
+            provType = PROV_RSA_FULL;
+        }
+        ret = CryptAcquireContextW(phCryptProv, info->pwszContainerName, provName, provType, flags);
         if (!ret)
         {
             flags |= CRYPT_MACHINE_KEYSET;
-            ret = CryptAcquireContextW(phCryptProv, info->pwszContainerName, info->pwszProvName, info->dwProvType, flags);
+            ret = CryptAcquireContextW(phCryptProv, info->pwszContainerName, provName, provType, flags);
         }
         if (ret)
         {
@@ -2441,6 +2454,88 @@ BOOL WINAPI CryptHashToBeSigned(HCRYPTPROV_LEGACY hCryptProv,
     return ret;
 }
 
+static const WCHAR *CRYPT_HashAlgIdToBCrypt(ALG_ID algid, DWORD *hashLen)
+{
+    switch (algid)
+    {
+    case CALG_MD5:     *hashLen = 16; return BCRYPT_MD5_ALGORITHM;
+    case CALG_SHA1:    *hashLen = 20; return BCRYPT_SHA1_ALGORITHM;
+    case CALG_SHA_256: *hashLen = 32; return BCRYPT_SHA256_ALGORITHM;
+    case CALG_SHA_384: *hashLen = 48; return BCRYPT_SHA384_ALGORITHM;
+    case CALG_SHA_512: *hashLen = 64; return BCRYPT_SHA512_ALGORITHM;
+    default:           *hashLen = 0;  return NULL;
+    }
+}
+
+/* Sign a to-be-signed cert blob with a CNG (NCRYPT) RSA private key. SQL Server
+ * 2022 hands CertCreateSelfSignCertificate an NCRYPT_KEY_HANDLE; the legacy
+ * CryptCreateHash/CryptSignHashW path cannot use it, so hash with BCrypt and
+ * sign with NCryptSignHash (PKCS#1). NCrypt/BCrypt return the signature in
+ * big-endian, but CryptoAPI callers (and the X509_CERT encoder's
+ * CRYPT_AsnEncodeBitsSwapBytes) expect little-endian, so reverse it. */
+static BOOL CRYPT_SignCertificateCNG(NCRYPT_KEY_HANDLE hKey, ALG_ID hashAlgid,
+ const BYTE *toBeSigned, DWORD toBeSignedLen, BYTE *pbSignature, DWORD *pcbSignature)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_PKCS1_PADDING_INFO pad;
+    const WCHAR *algName;
+    DWORD hashLen = 0, sigLen = 0, i;
+    BYTE hash[64], tmp;
+    SECURITY_STATUS status;
+    NTSTATUS bstatus;
+
+    if (!(algName = CRYPT_HashAlgIdToBCrypt(hashAlgid, &hashLen)))
+    {
+        SetLastError(NTE_BAD_ALGID);
+        return FALSE;
+    }
+    if (BCryptOpenAlgorithmProvider(&alg, algName, NULL, 0))
+    {
+        SetLastError(NTE_BAD_ALGID);
+        return FALSE;
+    }
+    bstatus = BCryptHash(alg, NULL, 0, (BYTE *)toBeSigned, toBeSignedLen, hash, hashLen);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (bstatus)
+    {
+        SetLastError(NTE_FAIL);
+        return FALSE;
+    }
+
+    pad.pszAlgId = algName;
+    status = NCryptSignHash(hKey, &pad, hash, hashLen, NULL, 0, &sigLen, BCRYPT_PAD_PKCS1);
+    if (status != ERROR_SUCCESS)
+    {
+        SetLastError(status);
+        return FALSE;
+    }
+    if (!pbSignature)
+    {
+        *pcbSignature = sigLen;
+        return TRUE;
+    }
+    if (*pcbSignature < sigLen)
+    {
+        *pcbSignature = sigLen;
+        SetLastError(ERROR_MORE_DATA);
+        return FALSE;
+    }
+    status = NCryptSignHash(hKey, &pad, hash, hashLen, pbSignature, *pcbSignature, &sigLen, BCRYPT_PAD_PKCS1);
+    if (status != ERROR_SUCCESS)
+    {
+        SetLastError(status);
+        return FALSE;
+    }
+    for (i = 0; i < sigLen / 2; i++)
+    {
+        tmp = pbSignature[i];
+        pbSignature[i] = pbSignature[sigLen - 1 - i];
+        pbSignature[sigLen - 1 - i] = tmp;
+    }
+    *pcbSignature = sigLen;
+    return TRUE;
+}
+
 BOOL WINAPI CryptSignCertificate(HCRYPTPROV_OR_NCRYPT_KEY_HANDLE hCryptProv,
  DWORD dwKeySpec, DWORD dwCertEncodingType, const BYTE *pbEncodedToBeSigned,
  DWORD cbEncodedToBeSigned, PCRYPT_ALGORITHM_IDENTIFIER pSignatureAlgorithm,
@@ -2461,6 +2556,10 @@ BOOL WINAPI CryptSignCertificate(HCRYPTPROV_OR_NCRYPT_KEY_HANDLE hCryptProv,
         SetLastError(NTE_BAD_ALGID);
         return FALSE;
     }
+    if (CRYPT_IsCNGKeyHandle(hCryptProv) &&
+     info->dwGroupId != CRYPT_HASH_ALG_OID_GROUP_ID)
+        return CRYPT_SignCertificateCNG(hCryptProv, info->Algid,
+         pbEncodedToBeSigned, cbEncodedToBeSigned, pbSignature, pcbSignature);
     if (info->dwGroupId == CRYPT_HASH_ALG_OID_GROUP_ID)
     {
         if (!hCryptProv)

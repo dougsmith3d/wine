@@ -1266,6 +1266,8 @@ BOOL WINAPI DECLSPEC_HOTPATCH QueryServiceObjectSecurity( SC_HANDLE service, SEC
 
     status = RtlMakeSelfRelativeSD( &descriptor, ret_descriptor, &size );
     *ret_size = size;
+    MESSAGE( "wine_qsos_dbg: QueryServiceObjectSecurity type=%#lx in_size=%lu out_size=%lu status=%#lx\n",
+             type, size, *ret_size, (unsigned long)status );
 
     return set_error( RtlNtStatusToDosError( status ) );
 }
@@ -1277,7 +1279,7 @@ BOOL WINAPI SetServiceObjectSecurity(SC_HANDLE hService,
        SECURITY_INFORMATION dwSecurityInformation,
        PSECURITY_DESCRIPTOR lpSecurityDescriptor)
 {
-    FIXME("%p %ld %p\n", hService, dwSecurityInformation, lpSecurityDescriptor);
+    MESSAGE("wine_qsos_dbg: SetServiceObjectSecurity %p info=%#lx sd=%p -> TRUE(noop)\n", hService, dwSecurityInformation, lpSecurityDescriptor);
     return TRUE;
 }
 

@@ -242,6 +242,46 @@ PERF_COUNTERSET_INSTANCE WINAPI *PerfCreateInstance( HANDLE handle, const GUID *
 }
 
 /***********************************************************************
+ *           PerfQueryInstance   (KERNELBASE.@)
+ */
+PERF_COUNTERSET_INSTANCE WINAPI *PerfQueryInstance( HANDLE handle, const GUID *guid,
+                                                    const WCHAR *name, ULONG id )
+{
+    struct perf_provider *prov = perf_provider_from_handle( handle );
+    struct counterset_template *template;
+    struct counterset_instance *inst;
+    unsigned int i;
+
+    FIXME( "handle %p, guid %s, name %s, id %lu semi-stub.\n", handle, debugstr_guid(guid), debugstr_w(name), id );
+
+    if (!prov || !guid || !name)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return NULL;
+    }
+
+    for (i = 0; i < prov->counterset_count; ++i)
+        if (IsEqualGUID(guid, &prov->countersets[i]->counterset.CounterSetGuid)) break;
+
+    if (i == prov->counterset_count)
+    {
+        SetLastError( ERROR_NOT_FOUND );
+        return NULL;
+    }
+
+    template = prov->countersets[i];
+
+    LIST_FOR_EACH_ENTRY(inst, &prov->instance_list, struct counterset_instance, entry)
+    {
+        if (inst->template == template && inst->instance.InstanceId == id)
+            return &inst->instance;
+    }
+
+    SetLastError( ERROR_NOT_FOUND );
+    return NULL;
+}
+
+/***********************************************************************
  *           PerfDeleteInstance   (KERNELBASE.@)
  */
 ULONG WINAPI PerfDeleteInstance(HANDLE provider, PERF_COUNTERSET_INSTANCE *block)

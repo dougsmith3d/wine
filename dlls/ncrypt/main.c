@@ -25,12 +25,59 @@
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
+#include "wincrypt.h"
 #include "ncrypt.h"
 #include "bcrypt.h"
 #include "ncrypt_internal.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(ncrypt);
+
+/* A CNG software KSP persists its keys so other components (e.g. schannel)
+ * can later load them by container name. Wine's secur32 schannel reads server
+ * private keys from rsaenh's legacy registry store
+ * (HKCU\Software\Wine\Crypto\RSA\<container>), and crypt32's
+ * CryptAcquireCertificatePrivateKey opens them through the legacy CSP API. So
+ * when a persisted RSA key is finalized, mirror it into rsaenh's container so
+ * the whole legacy code path (cert private-key acquisition + TLS credential)
+ * works unchanged. Needed for SQL Server 2022's CNG self-signed fallback cert. */
+static struct object_property *get_object_property(struct object *object, const WCHAR *name);
+
+static void persist_key_to_legacy_csp(struct object *key)
+{
+    struct object_property *prop;
+    const WCHAR *name;
+    BYTE *blob = NULL;
+    DWORD blob_len = 0;
+    HCRYPTPROV prov = 0;
+    HCRYPTKEY hkey = 0;
+
+    if (!(prop = get_object_property(key, NCRYPT_NAME_PROPERTY)) || !prop->value) return;
+    name = (const WCHAR *)prop->value;
+
+    if (BCryptExportKey(key->key.bcrypt_key, NULL, LEGACY_RSAPRIVATE_BLOB, NULL, 0, &blob_len, 0))
+        return;
+    if (!blob_len || !(blob = malloc(blob_len))) return;
+    if (BCryptExportKey(key->key.bcrypt_key, NULL, LEGACY_RSAPRIVATE_BLOB, blob, blob_len, &blob_len, 0))
+    {
+        free(blob);
+        return;
+    }
+
+    if (!CryptAcquireContextW(&prov, name, NULL, PROV_RSA_FULL, CRYPT_NEWKEYSET) &&
+        !CryptAcquireContextW(&prov, name, NULL, PROV_RSA_FULL, 0))
+    {
+        WARN("Could not open legacy container %s to persist key\n", wine_dbgstr_w(name));
+        free(blob);
+        return;
+    }
+    if (CryptImportKey(prov, blob, blob_len, 0, CRYPT_EXPORTABLE, &hkey))
+        CryptDestroyKey(hkey);
+    else
+        WARN("CryptImportKey failed %#lx persisting %s\n", GetLastError(), wine_dbgstr_w(name));
+    CryptReleaseContext(prov, 0);
+    free(blob);
+}
 
 static SECURITY_STATUS map_ntstatus(NTSTATUS status)
 {
@@ -54,6 +101,7 @@ static struct object *allocate_object(enum object_type type)
 {
     struct object *ret;
     if (!(ret = calloc(1, sizeof(*ret)))) return NULL;
+    ret->magic = NCRYPT_OBJECT_MAGIC;
     ret->type = type;
     return ret;
 }
@@ -150,6 +198,18 @@ static struct object *create_key_object(enum algid algid, NCRYPT_PROV_HANDLE pro
         set_object_property(object, BCRYPT_SIGNATURE_LENGTH, (BYTE *)&dw_value, sizeof(dw_value));
         break;
 
+    case ECDSA:
+        if (!(object = allocate_object(KEY))) return NULL;
+
+        object->key.algid = ECDSA;
+        set_object_property(object, NCRYPT_ALGORITHM_PROPERTY, (BYTE *)BCRYPT_ECDSA_P256_ALGORITHM,
+                            sizeof(BCRYPT_ECDSA_P256_ALGORITHM));
+        set_object_property(object, NCRYPT_ALGORITHM_GROUP_PROPERTY, (BYTE *)BCRYPT_ECDSA_ALGORITHM,
+                            sizeof(BCRYPT_ECDSA_ALGORITHM));
+        dw_value = 64;
+        set_object_property(object, BCRYPT_SIGNATURE_LENGTH, (BYTE *)&dw_value, sizeof(dw_value));
+        break;
+
     default:
         ERR("Invalid algid %#x\n", algid);
         return NULL;
@@ -198,6 +258,34 @@ SECURITY_STATUS WINAPI NCryptCreatePersistedKey(NCRYPT_PROV_HANDLE provider, NCR
 
         set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&default_bitlen, sizeof(default_bitlen));
         set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&default_bitlen, sizeof(default_bitlen));
+        if (name)
+            set_object_property(object, NCRYPT_NAME_PROPERTY, (BYTE *)name,
+                                (lstrlenW(name) + 1) * sizeof(WCHAR));
+    }
+    else if (!lstrcmpiW(algid, BCRYPT_ECDSA_P256_ALGORITHM))
+    {
+        NTSTATUS status;
+        DWORD bitlen = 256;
+
+        if (!(object = create_key_object(ECDSA, provider)))
+        {
+            ERR("Error allocating memory\n");
+            return NTE_NO_MEMORY;
+        }
+
+        status = BCryptGenerateKeyPair(BCRYPT_ECDSA_P256_ALG_HANDLE, &object->key.bcrypt_key, bitlen, 0);
+        if (status != STATUS_SUCCESS)
+        {
+            ERR("Error generating ECDSA key pair %#lx\n", status);
+            free(object);
+            return map_ntstatus(status);
+        }
+
+        set_object_property(object, NCRYPT_LENGTH_PROPERTY, (BYTE *)&bitlen, sizeof(bitlen));
+        set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&bitlen, sizeof(bitlen));
+        if (name)
+            set_object_property(object, NCRYPT_NAME_PROPERTY, (BYTE *)name,
+                                (lstrlenW(name) + 1) * sizeof(WCHAR));
     }
     else
     {
@@ -290,6 +378,8 @@ SECURITY_STATUS WINAPI NCryptFinalizeKey(NCRYPT_KEY_HANDLE handle, DWORD flags)
         ERR("Error finalizing key pair\n");
         return map_ntstatus(status);
     }
+
+    persist_key_to_legacy_csp(object);
 
     return ERROR_SUCCESS;
 }
@@ -505,8 +595,14 @@ SECURITY_STATUS WINAPI NCryptIsAlgSupported(NCRYPT_PROV_HANDLE provider, const W
 
 BOOL WINAPI NCryptIsKeyHandle(NCRYPT_KEY_HANDLE hKey)
 {
-    FIXME("(%#Ix): stub\n", hKey);
-    return FALSE;
+    const struct object *obj = (const struct object *)(ULONG_PTR)hKey;
+
+    TRACE("(%#Ix)\n", hKey);
+
+    /* A real CNG key object carries our magic; a legacy HCRYPTPROV (also a heap
+     * pointer under Wine) does not. This lets crypt32 route legacy CSP handles
+     * down the legacy CryptExportPublicKeyInfo path instead of NCrypt. */
+    return obj && obj->magic == NCRYPT_OBJECT_MAGIC && obj->type == KEY;
 }
 
 SECURITY_STATUS WINAPI NCryptOpenKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_HANDLE *key,

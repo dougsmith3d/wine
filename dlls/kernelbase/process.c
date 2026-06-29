@@ -1113,6 +1113,19 @@ HANDLE WINAPI DECLSPEC_HOTPATCH OpenProcess( DWORD access, BOOL inherit, DWORD i
 /***********************************************************************
  *           ProcessIdToSessionId   (kernelbase.@)
  */
+/***********************************************************************
+ *           WTSGetServiceSessionId   (kernelbase.@)
+ *
+ * Returns the session in which services run (session 0). SharePoint's farm
+ * provisioning GetProcAddress's this; a missing export means it calls NULL.
+ */
+DWORD WINAPI WTSGetServiceSessionId( void )
+{
+    static int once;
+    if (!once++) FIXME( "stub, returning session 0\n" );
+    return 0;
+}
+
 BOOL WINAPI DECLSPEC_HOTPATCH ProcessIdToSessionId( DWORD pid, DWORD *id )
 {
     HANDLE process;

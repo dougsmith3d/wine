@@ -1632,6 +1632,115 @@ static NTSTATUS aes_wrap( const UCHAR *secret, ULONG secret_len, const UCHAR *pl
     return STATUS_SUCCESS;
 }
 
+/* --- CAPI legacy RSA blob export (added for SQL Server 2022 self-signed cert under Wine) --- */
+static void capi_reverse_copy( UCHAR *dst, const UCHAR *src, ULONG len )
+{
+    ULONG i;
+    for (i = 0; i < len; i++) dst[i] = src[len - 1 - i];
+}
+
+static NTSTATUS export_rsa_capi_private( struct key *key, UCHAR *output, ULONG output_len, ULONG *size )
+{
+    struct key_asymmetric_export_params params;
+    BCRYPT_RSAKEY_BLOB *hdr;
+    UCHAR *full = NULL, *src;
+    ULONG full_len = 0, mod, half, blob_len, status;
+    PUBLICKEYSTRUC *pks;
+    RSAPUBKEY *rpk;
+    UCHAR *out;
+
+    /* first get full private blob size */
+    params.key = key; params.flags = KEY_EXPORT_FLAG_RSA_FULL;
+    params.buf = NULL; params.len = 0; params.ret_len = &full_len;
+    if ((status = UNIX_CALL( key_asymmetric_export, &params ))) return status;
+    if (!(full = malloc( full_len ))) return STATUS_NO_MEMORY;
+    params.buf = full; params.len = full_len; params.ret_len = &full_len;
+    if ((status = UNIX_CALL( key_asymmetric_export, &params ))) { free( full ); return status; }
+
+    hdr = (BCRYPT_RSAKEY_BLOB *)full;
+    mod = hdr->cbModulus;
+    half = hdr->cbPrime1;
+    /* CAPI PRIVATEKEYBLOB: header + RSAPUBKEY + mod + P + Q + Dp + Dq + iqmp + D */
+    blob_len = sizeof(PUBLICKEYSTRUC) + sizeof(RSAPUBKEY) + mod + half*5 + mod;
+    *size = blob_len;
+    if (!output) { free( full ); return STATUS_SUCCESS; }
+    if (output_len < blob_len) { free( full ); return STATUS_BUFFER_TOO_SMALL; }
+
+    pks = (PUBLICKEYSTRUC *)output;
+    pks->bType = PRIVATEKEYBLOB;
+    pks->bVersion = CUR_BLOB_VERSION;
+    pks->reserved = 0;
+    pks->aiKeyAlg = CALG_RSA_KEYX;
+    rpk = (RSAPUBKEY *)(pks + 1);
+    rpk->magic = BCRYPT_RSAPRIVATE_MAGIC; /* "RSA2" */
+    rpk->bitlen = hdr->BitLength;
+    rpk->pubexp = 0;
+    /* pubexp: big-endian cbPublicExp bytes -> DWORD LE */
+    {
+        ULONG i; UCHAR *e = full + sizeof(*hdr);
+        for (i = 0; i < hdr->cbPublicExp && i < 4; i++)
+            ((UCHAR *)&rpk->pubexp)[i] = e[hdr->cbPublicExp - 1 - i];
+    }
+    out = (UCHAR *)(rpk + 1);
+    /* full blob field order (big-endian): pubexp, modulus, P, Q, Dp(exp1), Dq(exp2), iqmp(coeff), D(privexp) */
+    src = full + sizeof(*hdr) + hdr->cbPublicExp;
+    capi_reverse_copy( out, src, mod ); out += mod; src += mod;        /* modulus */
+    capi_reverse_copy( out, src, half ); out += half; src += half;     /* P */
+    capi_reverse_copy( out, src, half ); out += half; src += half;     /* Q */
+    capi_reverse_copy( out, src, half ); out += half; src += half;     /* Dp */
+    capi_reverse_copy( out, src, half ); out += half; src += half;     /* Dq */
+    capi_reverse_copy( out, src, half ); out += half; src += half;     /* iqmp/coeff */
+    capi_reverse_copy( out, src, mod );                                /* D / private exponent */
+
+    free( full );
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS export_rsa_capi_public( struct key *key, UCHAR *output, ULONG output_len, ULONG *size )
+{
+    struct key_asymmetric_export_params params;
+    BCRYPT_RSAKEY_BLOB *hdr;
+    UCHAR *pub = NULL, *src;
+    ULONG pub_len = 0, mod, blob_len, status;
+    PUBLICKEYSTRUC *pks;
+    RSAPUBKEY *rpk;
+    UCHAR *out;
+
+    params.key = key; params.flags = KEY_EXPORT_FLAG_PUBLIC;
+    params.buf = NULL; params.len = 0; params.ret_len = &pub_len;
+    if ((status = UNIX_CALL( key_asymmetric_export, &params ))) return status;
+    if (!(pub = malloc( pub_len ))) return STATUS_NO_MEMORY;
+    params.buf = pub; params.len = pub_len; params.ret_len = &pub_len;
+    if ((status = UNIX_CALL( key_asymmetric_export, &params ))) { free( pub ); return status; }
+
+    hdr = (BCRYPT_RSAKEY_BLOB *)pub;
+    mod = hdr->cbModulus;
+    blob_len = sizeof(PUBLICKEYSTRUC) + sizeof(RSAPUBKEY) + mod;
+    *size = blob_len;
+    if (!output) { free( pub ); return STATUS_SUCCESS; }
+    if (output_len < blob_len) { free( pub ); return STATUS_BUFFER_TOO_SMALL; }
+
+    pks = (PUBLICKEYSTRUC *)output;
+    pks->bType = PUBLICKEYBLOB;
+    pks->bVersion = CUR_BLOB_VERSION;
+    pks->reserved = 0;
+    pks->aiKeyAlg = CALG_RSA_KEYX;
+    rpk = (RSAPUBKEY *)(pks + 1);
+    rpk->magic = BCRYPT_RSAPUBLIC_MAGIC; /* "RSA1" */
+    rpk->bitlen = hdr->BitLength;
+    rpk->pubexp = 0;
+    {
+        ULONG i; UCHAR *e = pub + sizeof(*hdr);
+        for (i = 0; i < hdr->cbPublicExp && i < 4; i++)
+            ((UCHAR *)&rpk->pubexp)[i] = e[hdr->cbPublicExp - 1 - i];
+    }
+    out = (UCHAR *)(rpk + 1);
+    src = pub + sizeof(*hdr) + hdr->cbPublicExp;
+    capi_reverse_copy( out, src, mod ); /* modulus */
+    free( pub );
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS key_export( struct key *key, struct key *encrypt_key, const WCHAR *type, UCHAR *output,
                             ULONG output_len, ULONG *size )
 {
@@ -1717,6 +1826,14 @@ static NTSTATUS key_export( struct key *key, struct key *encrypt_key, const WCHA
                 return status;
         }
         return STATUS_SUCCESS;
+    }
+    else if (!wcscmp( type, LEGACY_RSAPRIVATE_BLOB ))
+    {
+        return export_rsa_capi_private( key, output, output_len, size );
+    }
+    else if (!wcscmp( type, LEGACY_RSAPUBLIC_BLOB ))
+    {
+        return export_rsa_capi_public( key, output, output_len, size );
     }
 
     FIXME( "unsupported key type %s\n", debugstr_w(type) );

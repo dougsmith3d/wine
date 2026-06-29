@@ -32,6 +32,10 @@
 #include "iads.h"
 #include "adshlp.h"
 #include "adserr.h"
+#include "lmcons.h"
+#include "lmwksta.h"
+#include "lmapibuf.h"
+#include "lmerr.h"
 
 #include "wine/debug.h"
 
@@ -162,6 +166,232 @@ HRESULT WINAPI ADsBuildVarArrayInt(LPDWORD values, DWORD count, VARIANT* var)
 /*****************************************************
  * ADsOpenObject     [ACTIVEDS.9]
  */
+
+/* Minimal WinNT:// ADSI namespace provider.
+ *
+ * Wine ships only the LDAP provider; apps that resolve the local machine's
+ * domain/workgroup via `new DirectoryEntry("WinNT://" + machine).Parent.Name`
+ * (e.g. SharePoint's SPServer.Domain) get a failed bind. Implement just enough
+ * IADs (Name/ADsPath/Parent) to answer that, resolving the workgroup name via
+ * NetWkstaGetInfo. */
+typedef struct
+{
+    IADs IADs_iface;
+    LONG ref;
+    BSTR name;
+    BSTR adspath;
+    BSTR parent;
+} winnt_object;
+
+static inline winnt_object *impl_from_winnt_IADs(IADs *iface)
+{
+    return CONTAINING_RECORD(iface, winnt_object, IADs_iface);
+}
+
+static HRESULT WINAPI winnt_QueryInterface(IADs *iface, REFIID riid, void **obj)
+{
+    winnt_object *o = impl_from_winnt_IADs(iface);
+    if (!obj) return E_INVALIDARG;
+    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IDispatch) ||
+        IsEqualGUID(riid, &IID_IADs))
+    {
+        IADs_AddRef(&o->IADs_iface);
+        *obj = &o->IADs_iface;
+        return S_OK;
+    }
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI winnt_AddRef(IADs *iface)
+{
+    winnt_object *o = impl_from_winnt_IADs(iface);
+    return InterlockedIncrement(&o->ref);
+}
+
+static ULONG WINAPI winnt_Release(IADs *iface)
+{
+    winnt_object *o = impl_from_winnt_IADs(iface);
+    LONG ref = InterlockedDecrement(&o->ref);
+    if (!ref)
+    {
+        SysFreeString(o->name);
+        SysFreeString(o->adspath);
+        SysFreeString(o->parent);
+        free(o);
+    }
+    return ref;
+}
+
+static HRESULT WINAPI winnt_GetTypeInfoCount(IADs *iface, UINT *count)
+{
+    if (count) *count = 0;
+    return S_OK;
+}
+static HRESULT WINAPI winnt_GetTypeInfo(IADs *iface, UINT i, LCID lcid, ITypeInfo **ti)
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_GetIDsOfNames(IADs *iface, REFIID riid, LPOLESTR *names,
+                                          UINT count, LCID lcid, DISPID *dispid)
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_Invoke(IADs *iface, DISPID dispid, REFIID riid, LCID lcid,
+                                   WORD flags, DISPPARAMS *params, VARIANT *result,
+                                   EXCEPINFO *ei, UINT *err)
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI winnt_get_Name(IADs *iface, BSTR *retval)
+{
+    winnt_object *o = impl_from_winnt_IADs(iface);
+    if (!retval) return E_INVALIDARG;
+    *retval = SysAllocString(o->name);
+    return *retval ? S_OK : E_OUTOFMEMORY;
+}
+static HRESULT WINAPI winnt_get_Class(IADs *iface, BSTR *retval)
+{
+    if (retval) *retval = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_get_GUID(IADs *iface, BSTR *retval)
+{
+    if (retval) *retval = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_get_ADsPath(IADs *iface, BSTR *retval)
+{
+    winnt_object *o = impl_from_winnt_IADs(iface);
+    if (!retval) return E_INVALIDARG;
+    *retval = SysAllocString(o->adspath);
+    return *retval ? S_OK : E_OUTOFMEMORY;
+}
+static HRESULT WINAPI winnt_get_Parent(IADs *iface, BSTR *retval)
+{
+    winnt_object *o = impl_from_winnt_IADs(iface);
+    if (!retval) return E_INVALIDARG;
+    if (!o->parent) return E_ADS_BAD_PATHNAME;
+    *retval = SysAllocString(o->parent);
+    return *retval ? S_OK : E_OUTOFMEMORY;
+}
+static HRESULT WINAPI winnt_get_Schema(IADs *iface, BSTR *retval)
+{
+    if (retval) *retval = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_GetInfo(IADs *iface) { return S_OK; }
+static HRESULT WINAPI winnt_SetInfo(IADs *iface) { return S_OK; }
+static HRESULT WINAPI winnt_Get(IADs *iface, BSTR name, VARIANT *prop)
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_Put(IADs *iface, BSTR name, VARIANT prop)
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_GetEx(IADs *iface, BSTR name, VARIANT *prop)
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_PutEx(IADs *iface, LONG code, BSTR name, VARIANT prop)
+{
+    return E_NOTIMPL;
+}
+static HRESULT WINAPI winnt_GetInfoEx(IADs *iface, VARIANT name, LONG reserved)
+{
+    return E_NOTIMPL;
+}
+
+static const IADsVtbl winnt_IADs_vtbl =
+{
+    winnt_QueryInterface,
+    winnt_AddRef,
+    winnt_Release,
+    winnt_GetTypeInfoCount,
+    winnt_GetTypeInfo,
+    winnt_GetIDsOfNames,
+    winnt_Invoke,
+    winnt_get_Name,
+    winnt_get_Class,
+    winnt_get_GUID,
+    winnt_get_ADsPath,
+    winnt_get_Parent,
+    winnt_get_Schema,
+    winnt_GetInfo,
+    winnt_SetInfo,
+    winnt_Get,
+    winnt_Put,
+    winnt_GetEx,
+    winnt_PutEx,
+    winnt_GetInfoEx
+};
+
+/* Workgroup/domain name of this machine, as a BSTR ("WORKGROUP" fallback). */
+static BSTR winnt_get_langroup(void)
+{
+    WKSTA_INFO_100 *info = NULL;
+    BSTR ret = NULL;
+    if (NetWkstaGetInfo(NULL, 100, (BYTE **)&info) == NERR_Success && info && info->wki100_langroup)
+        ret = SysAllocString(info->wki100_langroup);
+    if (info) NetApiBufferFree(info);
+    if (!ret) ret = SysAllocString(L"WORKGROUP");
+    return ret;
+}
+
+static HRESULT WinNT_create(LPCWSTR path, REFIID riid, void **obj)
+{
+    winnt_object *o;
+    const WCHAR *rest, *last;
+    HRESULT hr;
+
+    *obj = NULL;
+    /* path looks like "WinNT:" or "WinNT://A/B/..." */
+    rest = path + 6; /* skip "WinNT:" */
+    while (*rest == '/') rest++;
+
+    if (!(o = calloc(1, sizeof(*o)))) return E_OUTOFMEMORY;
+    o->IADs_iface.lpVtbl = &winnt_IADs_vtbl;
+    o->ref = 1;
+    o->adspath = SysAllocString(path);
+
+    if (!*rest)
+    {
+        /* the namespace root "WinNT:" */
+        o->name = SysAllocString(L"WinNT:");
+        o->parent = NULL;
+    }
+    else
+    {
+        WCHAR buf[512];
+        last = wcsrchr(rest, '/');
+        o->name = SysAllocString(last ? last + 1 : rest);
+        if (last)
+        {
+            size_t n = last - path;
+            if (n < ARRAY_SIZE(buf))
+            {
+                memcpy(buf, path, n * sizeof(WCHAR));
+                buf[n] = 0;
+                o->parent = SysAllocString(buf);
+            }
+        }
+        else
+        {
+            /* single component (the machine): parent is the workgroup/domain */
+            BSTR grp = winnt_get_langroup();
+            swprintf(buf, ARRAY_SIZE(buf), L"WinNT://%s", grp);
+            o->parent = SysAllocString(buf);
+            SysFreeString(grp);
+        }
+    }
+
+    hr = IADs_QueryInterface(&o->IADs_iface, riid, obj);
+    IADs_Release(&o->IADs_iface);
+    return hr;
+}
+
 HRESULT WINAPI ADsOpenObject(LPCWSTR path, LPCWSTR user, LPCWSTR password, DWORD reserved, REFIID riid, void **obj)
 {
     HRESULT hr;
@@ -175,6 +405,9 @@ HRESULT WINAPI ADsOpenObject(LPCWSTR path, LPCWSTR user, LPCWSTR password, DWORD
         return E_INVALIDARG;
 
     hr = E_FAIL;
+
+    if (!wcsnicmp(path, L"WinNT:", 6))
+        return WinNT_create(path, riid, obj);
 
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\ADs\\Providers", 0, KEY_READ, &hkey))
         return hr;

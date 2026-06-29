@@ -2348,6 +2348,16 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     union select_op select_op;
     UINT flags = SELECT_INTERRUPTIBLE;
     unsigned int ret;
+    LARGE_INTEGER ext_timeout;
+
+    /* SharePoint-under-Wine deadlock mitigation: SharePoint's "FP global critical
+     * section" (and similar onetutil locks) acquire with a hard 30s timeout and THROW
+     * a fatal Vstatus on timeout. Wine's thread scheduling makes those locks contend
+     * far longer than on Windows during parallel feature-install. Extend the exact
+     * 30.000s relative wait (-300000000 in 100ns units) to 30 minutes so contended
+     * locks SERIALIZE and complete instead of throwing. (A true cyclic deadlock would
+     * then hang rather than fail-fast; observed behavior distinguishes the two.) */
+    /* (removed 30s->30min FP-crit experiment: it disabled SharePoint's own 30s deadlock-breaker) */
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
 

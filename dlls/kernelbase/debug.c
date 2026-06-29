@@ -403,6 +403,28 @@ void WINAPI DECLSPEC_HOTPATCH RaiseException( DWORD code, DWORD flags, DWORD cou
     }
     else record.NumberParameters = 0;
 
+    /* DIAG (SharePoint OWSSVR): decode the C++ exception type name so we can see
+     * WHICH C++ exception is being thrown. MSVC x64 CXX throw:
+     *   args[0]=magic 0x19930520, args[1]=object, args[2]=ThrowInfo*, args[3]=imagebase */
+    if (code == 0xe06d7363 && count >= 4 && args[0] == 0x19930520 && args[3])
+    {
+        ULONG_PTR base = args[3];
+        const int *ti = (const int *)args[2];      /* ThrowInfo */
+        if (ti && ti[3])                            /* +12: pCatchableTypeArray RVA */
+        {
+            const int *cta = (const int *)(base + (unsigned int)ti[3]);
+            if (cta[0] > 0)                         /* nCatchableTypes */
+            {
+                const int *ct = (const int *)(base + (unsigned int)cta[1]); /* first CatchableType */
+                if (ct[1])                          /* +4: pType RVA -> TypeDescriptor */
+                {
+                    const char *name = (const char *)(base + (unsigned int)ct[1] + 16); /* TD+16 = mangled name */
+                    MESSAGE( "wine_cxx_throw: type=%s\n", name );
+                }
+            }
+        }
+    }
+
     RtlRaiseException( &record );
 }
 #endif

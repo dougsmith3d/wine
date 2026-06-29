@@ -756,15 +756,29 @@ BOOL WINAPI ImpersonateLoggedOnUser( HANDLE token )
         FIXME( "(%p)\n", token );
         warn = FALSE;
     }
-    if (!GetTokenInformation( token, TokenType, &type, sizeof(type), &size )) return FALSE;
+    if (!GetTokenInformation( token, TokenType, &type, sizeof(type), &size ))
+    {
+        MESSAGE( "wine_imp_dbg: ImpersonateLoggedOnUser token=%p GetTokenInformation(TokenType) FAILED err=%lu\n", token, GetLastError() );
+        return FALSE;
+    }
+    MESSAGE( "wine_imp_dbg: ImpersonateLoggedOnUser token=%p type=%d\n", token, (int)type );
 
     if (type == TokenPrimary)
     {
-        if (!DuplicateToken( token, SecurityImpersonation, &dup )) return FALSE;
+        if (!DuplicateToken( token, SecurityImpersonation, &dup ))
+        {
+            MESSAGE( "wine_imp_dbg: DuplicateToken FAILED err=%lu\n", GetLastError() );
+            return FALSE;
+        }
         ret = SetThreadToken( NULL, dup );
+        if (!ret) MESSAGE( "wine_imp_dbg: SetThreadToken(dup) FAILED err=%lu\n", GetLastError() );
         NtClose( dup );
     }
-    else ret = SetThreadToken( NULL, token );
+    else
+    {
+        ret = SetThreadToken( NULL, token );
+        if (!ret) MESSAGE( "wine_imp_dbg: SetThreadToken(token) FAILED err=%lu\n", GetLastError() );
+    }
 
     return ret;
 }

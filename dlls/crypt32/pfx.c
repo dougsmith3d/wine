@@ -93,7 +93,7 @@ static WCHAR *get_provider_property( HCRYPTPROV prov, DWORD prop_id, DWORD *len 
     return ret;
 }
 
-static BOOL set_key_prov_info( const void *ctx, HCRYPTPROV prov )
+static BOOL set_key_prov_info( const void *ctx, HCRYPTPROV prov, DWORD flags )
 {
     CRYPT_KEY_PROV_INFO *prov_info;
     DWORD size, len_container, len_name;
@@ -124,11 +124,26 @@ static BOOL set_key_prov_info( const void *ctx, HCRYPTPROV prov )
     size = sizeof(prov_info->dwProvType);
     CryptGetProvParam( prov, PP_PROVTYPE, (BYTE *)&prov_info->dwProvType, &size, 0 );
 
-    prov_info->dwFlags     = 0;
+    prov_info->dwFlags     = flags & CRYPT_MACHINE_KEYSET;
     prov_info->cProvParam  = 0;
     prov_info->rgProvParam = NULL;
-    size = sizeof(prov_info->dwKeySpec);
-    CryptGetProvParam( prov, PP_KEYSPEC, (BYTE *)&prov_info->dwKeySpec, &size, 0 );
+    /* PP_KEYSPEC reports the keyspecs the CSP SUPPORTS (AT_SIGNATURE|AT_KEYEXCHANGE),
+     * not which key the container actually holds. Storing that bitmask makes a
+     * later CryptGetUserKey(dwKeySpec=3) fail NTE_NO_KEY. Probe the real key. */
+    {
+        HCRYPTKEY hkey;
+        if (CryptGetUserKey( prov, AT_KEYEXCHANGE, &hkey ))
+        {
+            prov_info->dwKeySpec = AT_KEYEXCHANGE;
+            CryptDestroyKey( hkey );
+        }
+        else if (CryptGetUserKey( prov, AT_SIGNATURE, &hkey ))
+        {
+            prov_info->dwKeySpec = AT_SIGNATURE;
+            CryptDestroyKey( hkey );
+        }
+        else prov_info->dwKeySpec = AT_KEYEXCHANGE;
+    }
 
     ret = CertSetCertificateContextProperty( ctx, CERT_KEY_PROV_INFO_PROP_ID, 0, prov_info );
 
@@ -197,7 +212,7 @@ HCERTSTORE WINAPI PFXImportCertStore( CRYPT_DATA_BLOB *pfx, const WCHAR *passwor
                 goto error;
             }
         }
-        else if (!set_key_prov_info( ctx, prov ))
+        else if (!set_key_prov_info( ctx, prov, flags ))
         {
             WARN( "failed to set provider info property %08lx\n", GetLastError() );
             CertFreeCertificateContext( ctx );
@@ -238,6 +253,83 @@ BOOL WINAPI PFXExportCertStore( HCERTSTORE store, CRYPT_DATA_BLOB *pfx, const WC
 BOOL WINAPI PFXExportCertStoreEx( HCERTSTORE store, CRYPT_DATA_BLOB *pfx, const WCHAR *password, void *reserved,
                                   DWORD flags )
 {
-    FIXME( "(%p, %p, %p, %p, %08lx): stub\n", store, pfx, password, reserved, flags );
-    return FALSE;
+    PCCERT_CONTEXT cert, found = NULL;
+    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE prov = 0;
+    HCRYPTKEY hkey = 0;
+    DWORD keyspec = 0, blob_size = 0, pfx_size = 0;
+    BOOL caller_free = FALSE, ret = FALSE;
+    BYTE *key_blob = NULL;
+    struct export_cert_store_params params;
+
+    TRACE( "(%p, %p, %p, %p, %08lx)\n", store, pfx, password, reserved, flags );
+
+    if (!store || !pfx) { SetLastError( ERROR_INVALID_PARAMETER ); return FALSE; }
+
+    if (!(cert = CertEnumCertificatesInStore( store, NULL )))
+    {
+        SetLastError( CRYPT_E_NOT_FOUND );
+        return FALSE;
+    }
+    if (CertEnumCertificatesInStore( store, cert ))
+        FIXME( "exporting only the first certificate of a multi-cert store\n" );
+    found = CertDuplicateCertificateContext( cert );
+
+    /* Export the certificate's private key as a legacy MS PRIVATEKEYBLOB. */
+    if ((flags & EXPORT_PRIVATE_KEYS) &&
+        CryptAcquireCertificatePrivateKey( found, CRYPT_ACQUIRE_SILENT_FLAG, NULL, &prov, &keyspec, &caller_free ))
+    {
+        if (keyspec == 0xffffffff) /* CERT_NCRYPT_KEY_SPEC */
+            FIXME( "CNG private key export not supported, exporting cert only\n" );
+        else if (CryptGetUserKey( prov, keyspec, &hkey ) &&
+                 CryptExportKey( hkey, 0, PRIVATEKEYBLOB, 0, NULL, &blob_size ) &&
+                 (key_blob = CryptMemAlloc( blob_size )) &&
+                 CryptExportKey( hkey, 0, PRIVATEKEYBLOB, 0, key_blob, &blob_size ))
+        {
+            /* got the private key */
+        }
+        else
+        {
+            WARN( "private key export failed %08lx\n", GetLastError() );
+            CryptMemFree( key_blob );
+            key_blob = NULL;
+            blob_size = 0;
+        }
+    }
+
+    params.cert          = found->pbCertEncoded;
+    params.cert_size     = found->cbCertEncoded;
+    params.key_blob      = key_blob;
+    params.key_blob_size = blob_size;
+    params.password      = password;
+
+    /* size query */
+    params.buf = NULL;
+    params.buf_size = &pfx_size;
+    CRYPT32_CALL( export_cert_store, &params );
+    if (!pfx_size) { SetLastError( NTE_FAIL ); goto done; }
+
+    if (!pfx->pbData)
+    {
+        pfx->cbData = pfx_size;
+        ret = TRUE;
+        goto done;
+    }
+    if (pfx->cbData < pfx_size)
+    {
+        pfx->cbData = pfx_size;
+        SetLastError( ERROR_MORE_DATA );
+        goto done;
+    }
+
+    params.buf = pfx->pbData;
+    params.buf_size = &pfx->cbData;
+    if (!CRYPT32_CALL( export_cert_store, &params )) ret = TRUE;   /* STATUS_SUCCESS */
+    else SetLastError( NTE_FAIL );
+
+done:
+    if (hkey) CryptDestroyKey( hkey );
+    if (prov && caller_free) CryptReleaseContext( prov, 0 );
+    CryptMemFree( key_blob );
+    if (found) CertFreeCertificateContext( found );
+    return ret;
 }

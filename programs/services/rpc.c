@@ -2166,6 +2166,13 @@ DWORD RPC_Init(void)
         return err;
     }
 
+    /* Register NTLM auth so authenticated svcctl binds (e.g. from SQL Server
+     * setup, which binds ncacn_np:[\\pipe\\svcctl] with RpcBindingSetAuthInfo
+     * RPC_C_AUTHN_WINNT) are accepted instead of rejected with
+     * RPC_S_UNKNOWN_AUTHN_SERVICE. */
+    if ((err = RpcServerRegisterAuthInfoW(NULL, RPC_C_AUTHN_WINNT, NULL, NULL)) != ERROR_SUCCESS)
+        WINE_WARN("RpcServerRegisterAuthInfoW(WINNT) failed with error %lu\n", err);
+
     if ((err = RpcServerListen(1, RPC_C_LISTEN_MAX_CALLS_DEFAULT, TRUE)) != ERROR_SUCCESS)
     {
         WINE_ERR("RpcServerListen failed with error %lu\n", err);

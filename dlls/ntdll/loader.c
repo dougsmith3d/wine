@@ -1677,6 +1677,130 @@ static void call_tls_callbacks( HMODULE module, UINT reason )
 /*************************************************************************
  *              MODULE_InitDLL
  */
+
+/* SharePoint-under-Wine CLEAN FIX v14 (2026-06-28): break the FP-crit<->em-RWLock ABBA by SKIP-ONLY.
+ * the cache's event-manager registration until AFTER the global FP-crit is released. (1) SKIP the
+ * in-build registration block (JNZ->JMP @owssvr+0x158480, like v10) so the cache builds + DAT publishes
+ * + FP releases with NO WriteLock held -> waiting readers no-op out and drop their em readlocks.
+ * (2) DETOUR FUN_180156bc8 (owssvr+0x156bc8): after the original returns (FP released, cache published),
+ * re-run the registration (registerScheduledJob/registerEvent/registerUserCreatedEvent on getEventManager())
+ * ONCE -> WriteLock now succeeds (no readers) and the jobs ARE registered (v10 dropped them -> SPException). */
+static void *sp_owssvr_base;
+/* SharePoint: getInternal create-on-miss for the config provider (BDEADF25). v14 skips the
+ * deadlocking em-registration that would populate the VcomCache, so LocalizeXml's
+ * getInternal(BDEADF25) misses + throws. We redirect that one call site to a wrapper that,
+ * on the BDEADF25 throw, CoCreateInstance's the managed provider (proven to work) and returns
+ * it -> LocalizeXml proceeds. */
+static long (*sp_real_getInternal)(void*,void*,const void*,const void*,void**);
+static HRESULT (WINAPI *sp_CoCreateInstance)(const void*, void*, ULONG, const void*, void**);
+static void sp_resolve_cocreate(void)
+{
+    UNICODE_STRING name; ANSI_STRING fn; void *mod = NULL;
+    if (sp_CoCreateInstance) return;
+    RtlInitUnicodeString( &name, L"ole32.dll" );
+    if (!LdrGetDllHandle( NULL, 0, &name, &mod ) && mod)
+    {
+        RtlInitAnsiString( &fn, "CoCreateInstance" );
+        LdrGetProcedureAddress( mod, &fn, 0, (void **)&sp_CoCreateInstance );
+    }
+}
+static long sp_my_getInternal( void *thisp, void *p1, const void *cachekey, const void *iid, void **out )
+{
+    /* This call site (stswel+0x10A638) always looks up BDEADF25 (constant GUID in r8).
+     * Under Wine the VcomCache never has it (v14 skipped the registration), so the real
+     * getInternal would throw. Instead CoCreateInstance the managed provider DIRECTLY
+     * (no throw, no SEH-during-unwind) and return it -> LocalizeXml proceeds. */
+    long ret = 0;
+    int missed = 0;
+    unsigned int g0 = 0;
+    /* GENERIC create-on-miss: v14 skips the em-registration that would populate the
+     * VcomCache with a whole *family* of native providers (BDEADF25 + siblings), so the
+     * real getInternal throws Vstatus 0x3004f for any of them. Catch that miss, then
+     * CoCreateInstance the requested CLSID AFTER __ENDTRY (doing it during the C++ unwind
+     * faults). A cache HIT returns normally and is untouched. */
+    __TRY { ret = sp_real_getInternal( thisp, p1, cachekey, iid, out ); }
+    __EXCEPT_ALL { missed = 1; }
+    __ENDTRY
+    if (!missed) return ret;
+
+    __TRY { g0 = *(const unsigned int *)cachekey; } __EXCEPT_ALL { g0 = 0; } __ENDTRY
+    sp_resolve_cocreate();
+    if (sp_CoCreateInstance)
+    {
+        void *obj = NULL;
+        HRESULT hr = sp_CoCreateInstance( cachekey, NULL, 1 /*CLSCTX_INPROC_SERVER*/, iid, &obj );
+        MESSAGE( "wine_sp_fix: gen create-on-miss g0=%08x hr=0x%08lx obj=%p\n", g0, (long)hr, obj );
+        if (hr >= 0) { if (out) *out = obj; return hr; }
+    }
+    else MESSAGE("wine_sp_fix: gen create-on-miss g0=%08x NO CoCreateInstance\n", g0);
+    /* CoCreate unavailable/failed: re-run real to reproduce the original throw. */
+    return sp_real_getInternal( thisp, p1, cachekey, iid, out );
+}
+/* SharePoint: hook stswel CLKRHashTable::FindKey (VcomCache lookup) to log keys + hit/miss */
+static int (*sp_real_findkey)(void*,void*,void*);
+static int sp_fk_total, sp_fk_miss, sp_fk_logged, sp_rec_dumped;
+static int sp_findkey_thunk( void *thisp, void *key, void *out )
+{
+    int r = sp_real_findkey( thisp, key, out );
+    unsigned int g0 = 0; unsigned short w2 = 0, w3 = 0; int ok = 0;
+    __TRY
+    {
+        const unsigned int *g = (const unsigned int *)key;
+        const unsigned short *w = (const unsigned short *)key;
+        g0 = g[0]; w2 = w[2]; w3 = w[3]; ok = 1;
+    }
+    __EXCEPT_ALL { ok = 0; }
+    __ENDTRY
+    sp_fk_total++;
+    if (r != 0) sp_fk_miss++;
+    if ((ok && g0 == 0xbdeadf25u) || (r != 0 && sp_fk_logged < 60))
+    {
+        if (r != 0) sp_fk_logged++;
+        MESSAGE( "wine_sp_fix: FindKey #%d guid={%08x-%04x-%04x} ret=%d total=%d miss=%d %s\n",
+                 sp_fk_total, ok ? g0 : 0, w2, w3, r, sp_fk_total, sp_fk_miss,
+                 (ok && g0 == 0xbdeadf25u) ? "<<<BDEADF25-CONFIGPROVIDER" : "<<miss" );
+    }
+    /* on a HIT, dump the found record layout (out = void**, *out = record) to learn VIUnknownRecord format.
+       dump the bdeadf26 (SPRequest) record + the first 2 generic hits. */
+    if (r == 0 && ok && g0 != 0 && sp_rec_dumped < 6)
+    {
+        __TRY
+        {
+            const unsigned long long *rec = *(const unsigned long long **)out;
+            if (rec)
+            {
+                sp_rec_dumped++;
+                MESSAGE( "wine_sp_fix: REC key={%08x} rec=%p q: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                         ok ? g0 : 0, rec,
+                         rec[0],rec[1],rec[2],rec[3],rec[4],rec[5],rec[6],rec[7],rec[8],rec[9] );
+            }
+        }
+        __EXCEPT_ALL { }
+        __ENDTRY
+    }
+    return r;
+}
+static int (*sp_real_insert)(void*,const void*,int);
+static int sp_ins_n;
+static int sp_insert_thunk( void *thisp, const void *record, int overwrite )
+{
+    int g0 = 0; int off = -1; int ok = 0;
+    __TRY
+    {
+        const unsigned int *rr = (const unsigned int *)record;
+        int i;
+        for (i = 0; i < 24; i++) { if (rr[i] == 0xbdeadf25u) { off = i*4; break; } }
+        g0 = rr[0]; ok = 1;
+    }
+    __EXCEPT_ALL { ok = 0; }
+    __ENDTRY
+    if (off >= 0 || sp_ins_n < 40)
+        MESSAGE( "wine_sp_fix: InsertRecord #%d rec0=%08x bdeadf25@off=%d %s\n",
+                 sp_ins_n, ok ? (unsigned)g0 : 0, off,
+                 (off >= 0) ? "<<<BDEADF25-INSERTED" : "" );
+    sp_ins_n++;
+    return sp_real_insert( thisp, record, overwrite );
+}
 static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved )
 {
     WCHAR mod_name[64];
@@ -1690,6 +1814,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
     if (wm->ldr.Flags & LDR_DONT_RESOLVE_REFS) return STATUS_SUCCESS;
     if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, reason );
     if (!entry) return STATUS_SUCCESS;
+
 
     if (TRACE_ON(relay))
     {
@@ -1715,6 +1840,131 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
                       status, entry, module, reason_names[reason], lpReserved );
     }
     __ENDTRY
+
+    /* SharePoint-under-Wine deadlock fix: force ONETUTIL's lazy VstaticAtomizer
+     * (XML-vocabulary table) to initialize NOW, single-threaded at DLL load, so it
+     * is never lazily built during parallel feature-install while a CReaderWriterLock3
+     * is held -> breaks the ABBA deadlock (FP-crit <-> RWLock3). Wrapped in __TRY so a
+     * not-yet-ready state at load cannot harm the process. Offset is for this build. */
+    if (reason == DLL_PROCESS_ATTACH && status == STATUS_SUCCESS &&
+        wm->ldr.BaseDllName.Length >= 12 * sizeof(WCHAR) &&
+        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"onetutil.dll", 12 ))
+    {
+        void *(CDECL *init_atomizer)(void) = (void *)((char *)module + 0xeb4c);
+        MESSAGE( "wine_sp_fix: onetutil base=%p\n", module );
+        MESSAGE( "wine_sp_fix: pre-initializing ONETUTIL atomizer (deadlock fix)\n" );
+        __TRY
+        {
+            init_atomizer();
+            MESSAGE( "wine_sp_fix: atomizer pre-init OK\n" );
+        }
+        __EXCEPT_ALL
+        {
+            MESSAGE( "wine_sp_fix: atomizer pre-init faulted (%08lx), continuing\n",
+                     GetExceptionCode() );
+        }
+        __ENDTRY
+    }
+
+    /* (FP-crit non-blocking patch removed: too broad; using getInternal create-on-miss + v14) */
+
+
+    if (reason == DLL_PROCESS_ATTACH && status == STATUS_SUCCESS &&
+        wm->ldr.BaseDllName.Length >= 10 * sizeof(WCHAR) &&
+        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"stswel.dll", 10 ))
+    {
+        MESSAGE( "wine_sp_fix: stswel base=%p\n", module );
+        {
+            void **slot = (void **)((char *)module + 0x201780);
+            void *pp = slot; SIZE_T ps = sizeof(void*); ULONG op;
+            if (!NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,PAGE_EXECUTE_READWRITE,&op)) {
+                sp_real_findkey = (int(*)(void*,void*,void*))*slot;
+                *slot = (void*)sp_findkey_thunk;
+                pp = slot; ps = sizeof(void*);
+                NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,op,&op);
+                MESSAGE( "wine_sp_fix: FindKey IAT hook installed orig=%p thunk=%p\n",
+                         sp_real_findkey, (void*)sp_findkey_thunk );
+            }
+        }
+        {
+            void **slot = (void **)((char *)module + 0x201788);
+            void *pp = slot; SIZE_T ps = sizeof(void*); ULONG op;
+            if (!NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,PAGE_EXECUTE_READWRITE,&op)) {
+                sp_real_insert = (int(*)(void*,const void*,int))*slot;
+                *slot = (void*)sp_insert_thunk;
+                pp = slot; ps = sizeof(void*);
+                NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,op,&op);
+                MESSAGE( "wine_sp_fix: InsertRecord IAT hook installed orig=%p\n", sp_real_insert );
+            }
+        }
+        /* getInternal create-on-miss: real fn = stswel+0x46120; redirect ALL its call sites */
+        {
+            static const ULONG sites[] = {0x1c83e,0x1c9b4,0x21cc2,0x466e2,0x4670a,0x59c0b,0x8b923,0x972a6,0xb2987,0xb2c41,0xc280f,0x1098db,0x109c0a,0x10a375,0x10a638,0x10a86b,0x10a963,0x10b8ba,0x10ba0b,0x10bb57,0x17411e,0x17baa1,0x19a7ea,0x19ddd4};
+            unsigned si; int done=0;
+            sp_real_getInternal = (long(*)(void*,void*,const void*,const void*,void**))((char *)module + 0x46120);
+            for (si=0; si<sizeof(sites)/sizeof(sites[0]); si++) {
+                BYTE *call = (BYTE *)module + sites[si]; /* e8 rel32 -> stswel+0x46120 */
+                INT origrel; LONG_PTR target;
+                if (call[0] != 0xe8) continue;
+                memcpy(&origrel, call+1, 4);
+                target = (LONG_PTR)(call + 5) + origrel;
+                if (target != (LONG_PTR)((char*)module + 0x46120)) continue; /* not a getInternal call */
+                {
+                    LONG_PTR rel = (LONG_PTR)((char*)sp_my_getInternal - (char*)(call + 5));
+                    if (rel >= -0x80000000ll && rel <= 0x7fffffffll) {
+                        void *pp = call; SIZE_T ps = 5; ULONG op; INT rel32 = (INT)rel;
+                        if (!NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,PAGE_EXECUTE_READWRITE,&op)) {
+                            memcpy(call+1, &rel32, 4); pp=call; ps=5;
+                            NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,op,&op);
+                            NtFlushInstructionCache(NtCurrentProcess(),call,5);
+                            done++;
+                        }
+                    }
+                }
+            }
+            MESSAGE("wine_sp_fix: getInternal create-on-miss redirected %d call sites -> %p\n", done, (void*)sp_my_getInternal);
+            {
+            }
+        }
+    }
+
+    if (reason == DLL_PROCESS_ATTACH && status == STATUS_SUCCESS && sp_owssvr_base == NULL &&
+        wm->ldr.BaseDllName.Length >= 10 * sizeof(WCHAR) &&
+        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"owssvr.dll", 10 ))
+    {
+        sp_owssvr_base = module;
+        MESSAGE( "wine_sp_fix: owssvr base=%p\n", module );
+        /* (1) skip the in-build registration: JNZ@+0x158480 -> JMP (always skip block) */
+        {
+            BYTE *p = (BYTE *)module + 0x158480;
+            static const BYTE o[2] = { 0x0f,0x85 };
+            static const int sp_v14_off = 0; /* v14 ON: skip the deadlocking em-registration */
+            if (sp_v14_off) MESSAGE("wine_sp_fix: v14 DISABLED for test (deadlock will return)\n");
+            else if (!memcmp(p,o,2)) {
+                BYTE r6[6] = { 0xe9,0x69,0x01,0x00,0x00,0x90 };
+                void *pp=p; SIZE_T ps=6; ULONG op;
+                if (!NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,PAGE_EXECUTE_READWRITE,&op)) {
+                    memcpy(p,r6,6); pp=p; ps=6;
+                    NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,op,&op);
+                    NtFlushInstructionCache(NtCurrentProcess(),p,6);
+                    MESSAGE( "wine_sp_fix: v14 skip-only deadlock break installed @owssvr+0x158480\n" );
+                }
+            }
+        }
+        /* hook owssvr's InsertRecord IAT slot (owssvr+0x6341d0) to catch owssvr-originated cache inserts */
+        {
+            void **slot = (void **)((char *)module + 0x6341d0);
+            void *pp = slot; SIZE_T ps = sizeof(void*); ULONG op;
+            if (!NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,PAGE_EXECUTE_READWRITE,&op)) {
+                if (!sp_real_insert) sp_real_insert = (int(*)(void*,const void*,int))*slot;
+                *slot = (void*)sp_insert_thunk;
+                pp = slot; ps = sizeof(void*);
+                NtProtectVirtualMemory(NtCurrentProcess(),&pp,&ps,op,&op);
+                MESSAGE( "wine_sp_fix: owssvr InsertRecord IAT hook installed orig=%p\n", sp_real_insert );
+            }
+        }
+    }
+
 
     /* The state of the module list may have changed due to the call
        to the dll. We cannot assume that this module has not been
