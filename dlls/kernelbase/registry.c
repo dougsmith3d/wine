@@ -1328,24 +1328,91 @@ LONG WINAPI RegSetKeyValueA( HKEY hkey, LPCSTR subkey, LPCSTR name, DWORD type, 
     return ret;
 }
 
-/* FIXME: we should read data from system32/perf009c.dat (or perf###c depending
- * on locale) instead */
+/* Build the perf-counter name database (HKEY_PERFORMANCE_TEXT\"Counter 009") by
+ * enumerating registered categories under Services\*\Performance ("Counter Names").
+ * Windows synthesizes this from registered perf providers; Wine previously returned a
+ * hardcoded stub, which broke .NET PerformanceCounterCategory.Exists()/IsCustomCategory().
+ */
+static DWORD perf_uint_to_wstr( WCHAR *out, DWORD val )
+{
+    WCHAR tmp[16]; DWORD n = 0, i;
+    if (!val) { out[0] = '0'; out[1] = 0; return 1; }
+    while (val) { tmp[n++] = '0' + (val % 10); val /= 10; }
+    for (i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    out[n] = 0;
+    return n;
+}
+
+static void perf_append_pair( WCHAR **buf, DWORD *len, DWORD *cap, DWORD index, const WCHAR *name )
+{
+    WCHAR idxstr[16];
+    DWORD idxlen = perf_uint_to_wstr( idxstr, index ) + 1;
+    DWORD namelen = lstrlenW( name ) + 1;
+    if (*len + idxlen + namelen + 2 > *cap)
+    {
+        DWORD ncap = (*len + idxlen + namelen + 2) * 2;
+        WCHAR *nb = HeapReAlloc( GetProcessHeap(), 0, *buf, ncap * sizeof(WCHAR) );
+        if (!nb) return;
+        *buf = nb; *cap = ncap;
+    }
+    memcpy( *buf + *len, idxstr, idxlen * sizeof(WCHAR) ); *len += idxlen;
+    memcpy( *buf + *len, name, namelen * sizeof(WCHAR) ); *len += namelen;
+}
+
 static DWORD query_perf_names( DWORD *type, void *data, DWORD *ret_size, BOOL unicode )
 {
-    static const WCHAR names[] = L"1\0" "1847\0" "1846\0End Marker\0";
-    DWORD size = *ret_size;
+    DWORD size = *ret_size, cap = 8192, len = 0, i, idx = 2, sub, cntype, cnlen;
+    ERR("wine_perfdbg: enter data=%p ret_size=%u unicode=%d\n", data, *ret_size, unicode);
+    WCHAR *buf, svc[256], cn[1024];
+    HKEY services, service, perf;
+    static const WCHAR base[] = L"1\0" "1847\0";
+
+    if (!(buf = HeapAlloc( GetProcessHeap(), 0, cap * sizeof(WCHAR) ))) return ERROR_OUTOFMEMORY;
+    memcpy( buf, base, sizeof(base) - sizeof(WCHAR) );
+    len = (sizeof(base) / sizeof(WCHAR)) - 1;
+
+    if (!RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Services", 0, KEY_READ, &services ))
+    {
+        for (i = 0; ; i++)
+        {
+            sub = ARRAY_SIZE(svc);
+            if (RegEnumKeyExW( services, i, svc, &sub, NULL, NULL, NULL, NULL )) break;
+            if (RegOpenKeyExW( services, svc, 0, KEY_READ, &service )) continue;
+            if (!RegOpenKeyExW( service, L"Performance", 0, KEY_READ, &perf ))
+            {
+                DWORD lib_sz = 0;
+                if (!RegQueryValueExW( perf, L"Library", NULL, NULL, NULL, &lib_sz ) && lib_sz)
+                {
+                    perf_append_pair( &buf, &len, &cap, idx, svc ); idx += 2;
+                    cnlen = sizeof(cn) - sizeof(WCHAR);
+                    if (!RegQueryValueExW( perf, L"Counter Names", NULL, &cntype, (BYTE *)cn, &cnlen ) && cntype == REG_MULTI_SZ)
+                    {
+                        WCHAR *p = cn, *end = cn + cnlen / sizeof(WCHAR);
+                        cn[cnlen / sizeof(WCHAR)] = 0;
+                        while (p < end && *p)
+                        {
+                            perf_append_pair( &buf, &len, &cap, idx, p ); idx += 2;
+                            p += lstrlenW(p) + 1;
+                        }
+                    }
+                }
+                RegCloseKey( perf );
+            }
+            RegCloseKey( service );
+        }
+        RegCloseKey( services );
+    }
+    buf[len++] = 0;
+    ERR("wine_perfdbg: built len=%u idx=%u\n", len, idx);
 
     if (type) *type = REG_MULTI_SZ;
-    *ret_size = sizeof(names);
+    *ret_size = len * sizeof(WCHAR);
     if (!unicode) *ret_size /= sizeof(WCHAR);
-
-    if (!data) return ERROR_SUCCESS;
-    if (size < *ret_size) return ERROR_MORE_DATA;
-
-    if (unicode)
-        memcpy( data, names, sizeof(names) );
-    else
-        RtlUnicodeToMultiByteN( data, size, NULL, names, sizeof(names) );
+    if (!data) { HeapFree( GetProcessHeap(), 0, buf ); return ERROR_SUCCESS; }
+    if (size < *ret_size) { HeapFree( GetProcessHeap(), 0, buf ); return ERROR_MORE_DATA; }
+    if (unicode) memcpy( data, buf, len * sizeof(WCHAR) );
+    else RtlUnicodeToMultiByteN( data, size, NULL, buf, len * sizeof(WCHAR) );
+    HeapFree( GetProcessHeap(), 0, buf );
     return ERROR_SUCCESS;
 }
 

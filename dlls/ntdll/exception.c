@@ -244,8 +244,8 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
      * +12 = pCatchableTypeArray RVA; array+4 = first CatchableType RVA; CT+4 = pType
      * RVA -> TypeDescriptor; TD+16 = mangled name. */
     if (rec->ExceptionCode == 0xe0434352) {
-        MESSAGE("wine_mgd_throw tid=%04x np=%lu p0=%p p1=%p p2=%p\n",
-                (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, rec->NumberParameters,
+        MESSAGE("wine_mgd_throw pid=%04x tid=%04x np=%lu p0=%p p1=%p p2=%p\n",
+                (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, rec->NumberParameters,
                 (void*)rec->ExceptionInformation[0],
                 rec->NumberParameters>1?(void*)rec->ExceptionInformation[1]:(void*)0,
                 rec->NumberParameters>2?(void*)rec->ExceptionInformation[2]:(void*)0);
@@ -330,9 +330,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                           const WCHAR *ch = (const WCHAR *)((char *)msg + 0xc);
                           if (len && len < 400)
                           {
-                              MESSAGE("wine_exmsg: hr=%08x mt=%p msg=%.*ls\n",
-                                      (unsigned)rec->ExceptionInformation[0], mt, (int)len, ch);
-                              if (len>=9 && ch[0]=='R'&&ch[1]=='e'&&ch[2]=='c'&&ch[3]=='u'&&ch[4]=='r'&&ch[5]=='s'&&ch[6]=='i'&&ch[7]=='v'&&ch[8]=='e') {
+                              MESSAGE("wine_exmsg: pid=%04x hr=%08x mt=%p msg=%.*ls\n",
+                                      (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess, (unsigned)rec->ExceptionInformation[0], mt, (int)len, ch);
+                                                            if (0 && len>=7) {
                                   static int rdumped;
                                   if (!rdumped) { rdumped=1;
                                       __TRY {
@@ -344,7 +344,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                                               LdrGetProcedureAddress(dbg2,&as2,0,(void**)&mdwd2);
                                               if (mdwd2) {
                                                   UNICODE_STRING p2; OBJECT_ATTRIBUTES oa2; IO_STATUS_BLOCK io2; HANDLE fh2=NULL;
-                                                  RtlInitUnicodeString(&p2, L"\\??\\C:\\lockrec2.dmp");
+                                                  { WCHAR _wp[80]; DWORD _pid=(DWORD)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess;
+                                                      _snwprintf(_wp, 80, L"\\??\\C:\\lockrec_%u.dmp", _pid);
+                                                      RtlInitUnicodeString(&p2, _wp); }
                                                   InitializeObjectAttributes(&oa2,&p2,OBJ_CASE_INSENSITIVE,NULL,NULL);
                                                   if (!NtCreateFile(&fh2,GENERIC_WRITE|SYNCHRONIZE,&oa2,&io2,NULL,FILE_ATTRIBUTE_NORMAL,0,FILE_OVERWRITE_IF,FILE_SYNCHRONOUS_IO_NONALERT,NULL,0)) {
                                                       BOOL ok2 = mdwd2(NtCurrentProcess(),(ULONG)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess,fh2,0x2,NULL,NULL,NULL);
