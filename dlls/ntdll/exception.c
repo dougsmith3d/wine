@@ -249,6 +249,44 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                 (void*)rec->ExceptionInformation[0],
                 rec->NumberParameters>1?(void*)rec->ExceptionInformation[1]:(void*)0,
                 rec->NumberParameters>2?(void*)rec->ExceptionInformation[2]:(void*)0);
+        if ((unsigned)rec->ExceptionInformation[0] == 0x80131500)  /* LockRecursionException: write a full-memory minidump for SOS */
+        {
+            static int dumped;
+            if (!dumped)
+            {
+                dumped = 1;
+                __TRY
+                {
+                    UNICODE_STRING us; HMODULE dbg = NULL;
+                    RtlInitUnicodeString( &us, L"dbghelp.dll" );
+                    if (!LdrLoadDll( NULL, 0, &us, (void **)&dbg ) && dbg)
+                    {
+                        ANSI_STRING as; BOOL (WINAPI *mdwd)(HANDLE,ULONG,HANDLE,ULONG,void*,void*,void*) = NULL;
+                        RtlInitAnsiString( &as, "MiniDumpWriteDump" );
+                        LdrGetProcedureAddress( dbg, &as, 0, (void **)&mdwd );
+                        if (mdwd)
+                        {
+                            UNICODE_STRING path; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; HANDLE fh = NULL;
+                            RtlInitUnicodeString( &path, L"\\??\\C:\\lockrec.dmp" );
+                            InitializeObjectAttributes( &oa, &path, OBJ_CASE_INSENSITIVE, NULL, NULL );
+                            if (!NtCreateFile( &fh, GENERIC_WRITE|SYNCHRONIZE, &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
+                                               0, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 ))
+                            {
+                                BOOL ok = mdwd( NtCurrentProcess(), (ULONG)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess,
+                                                fh, 0x2 /*MiniDumpWithFullMemory*/, NULL, NULL, NULL );
+                                NtClose( fh );
+                                MESSAGE( "wine_lockdump: MiniDumpWriteDump ok=%d -> C:\\lockrec.dmp\n", ok );
+                            }
+                            else MESSAGE( "wine_lockdump: NtCreateFile failed\n" );
+                        }
+                        else MESSAGE( "wine_lockdump: no MiniDumpWriteDump\n" );
+                    }
+                    else MESSAGE( "wine_lockdump: dbghelp load failed\n" );
+                }
+                __EXCEPT_ALL { MESSAGE( "wine_lockdump: FAULTED\n" ); }
+                __ENDTRY
+            }
+        }
         if ((unsigned)rec->ExceptionInformation[0] == 0x80131500 && context)  /* LockRecursionException: native stack-walk */
         {
             static int lockdumps;
