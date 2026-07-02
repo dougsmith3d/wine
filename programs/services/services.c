@@ -157,6 +157,8 @@ static DWORD load_service_config(HKEY hKey, struct service_entry *entry)
         entry->is_wow64 = TRUE;
     if (load_reg_dword(hKey, L"DelayedAutoStart", &value) == 0 && value == 1)
         entry->delayed_autostart = TRUE;
+    if (load_reg_dword(hKey, L"FailureActionsFlag", &value) == 0 && value == 1)
+        entry->failure_actions_flag = TRUE;
 
     WINE_TRACE("Image path           = %s\n", wine_dbgstr_w(entry->config.lpBinaryPathName) );
     WINE_TRACE("Group                = %s\n", wine_dbgstr_w(entry->config.lpLoadOrderGroup) );
@@ -232,6 +234,13 @@ DWORD save_service_config(struct service_entry *entry)
     if ((err = reg_set_dword_value(hKey, L"ErrorControl", entry->config.dwErrorControl))) goto cleanup;
     if ((err = reg_set_dword_value(hKey, L"Type", entry->config.dwServiceType))) goto cleanup;
     if ((err = reg_set_dword_value(hKey, L"PreshutdownTimeout", entry->preshutdown_timeout))) goto cleanup;
+
+    if (entry->failure_actions_flag)
+        err = reg_set_dword_value(hKey, L"FailureActionsFlag", entry->failure_actions_flag);
+    else
+        err = RegDeleteValueW(hKey, L"FailureActionsFlag");
+    if (err != 0 && err != ERROR_FILE_NOT_FOUND)
+        goto cleanup;
 
     if (entry->delayed_autostart)
         err = reg_set_dword_value(hKey, L"DelayedAutoStart", entry->delayed_autostart);

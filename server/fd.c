@@ -1641,7 +1641,7 @@ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned 
     if (((access & read_access) && !(existing_sharing & FILE_SHARE_READ)) ||
         ((access & write_access) && !(existing_sharing & FILE_SHARE_WRITE)) ||
         ((access & DELETE) && !(existing_sharing & FILE_SHARE_DELETE)))
-        return STATUS_SHARING_VIOLATION;
+    { fprintf(stderr,"wine_sharechk: VIOL1 acc=%08x shr=%08x exacc=%08x exshr=%08x\n",access,sharing,existing_access,existing_sharing); return STATUS_SHARING_VIOLATION; }
     if (((existing_access & FILE_MAPPING_WRITE) && !(sharing & FILE_SHARE_WRITE)) ||
         ((existing_access & FILE_MAPPING_IMAGE) && (access & FILE_WRITE_DATA)))
         return STATUS_SHARING_VIOLATION;
@@ -1654,7 +1654,7 @@ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned 
     if (((existing_access & read_access) && !(sharing & FILE_SHARE_READ)) ||
         ((existing_access & write_access) && !(sharing & FILE_SHARE_WRITE)) ||
         ((existing_access & DELETE) && !(sharing & FILE_SHARE_DELETE)))
-        return STATUS_SHARING_VIOLATION;
+    { fprintf(stderr,"wine_sharechk: VIOL2 acc=%08x shr=%08x exacc=%08x exshr=%08x\n",access,sharing,existing_access,existing_sharing); return STATUS_SHARING_VIOLATION; }
     return 0;
 }
 

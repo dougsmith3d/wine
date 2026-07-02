@@ -936,6 +936,7 @@ HCERTSTORE WINAPI CertOpenStore(LPCSTR lpszStoreProvider,
          hCryptProv, dwFlags, pvPara);
     else
         hcs = openFunc(hCryptProv, dwFlags, pvPara);
+    if (hcs) { char ol[170]; DWORD on=0,ow; HANDLE oh; ULONG_PTR hp=(ULONG_PTR)hcs; int b; static const char ohx[]="0123456789abcdef"; const char *ot="OPENSTORE prov="; while(ot[on]){ol[on]=ot[on];on++;} if(IS_INTOID(lpszStoreProvider)){ ol[on++]=0x23; { unsigned pv=LOWORD(lpszStoreProvider); ol[on++]=ohx[(pv>>12)&15]; ol[on++]=ohx[(pv>>8)&15]; ol[on++]=ohx[(pv>>4)&15]; ol[on++]=ohx[pv&15]; } } else { DWORD oj=0; while(lpszStoreProvider[oj]&&on<80){ol[on++]=lpszStoreProvider[oj++];} } ol[on++]=0x20; ol[on++]=0x70; ol[on++]=0x3d; for(b=60;b>=0;b-=4){ol[on++]=ohx[(hp>>b)&15];} ol[on++]=0x20; ol[on++]=0x74; ol[on++]=0x3d; ol[on++]=(((WINECRYPT_CERTSTORE*)hcs)->type<4)?"MCPE"[((WINECRYPT_CERTSTORE*)hcs)->type]:0x3f; /* PROV_SYSTEM name */ if(pvPara && IS_INTOID(lpszStoreProvider)){ unsigned pv=LOWORD(lpszStoreProvider); DWORD ni=0; if(pv==0x0a){ const WCHAR *w=pvPara; ol[on++]=0x20;ol[on++]=0x6e;ol[on++]=0x6d;ol[on++]=0x3d; while(w[ni]&&ni<40&&on<170){ol[on++]=(char)(w[ni]&0xff);ni++;} } else if(pv==0x09){ const char *c=pvPara; ol[on++]=0x20;ol[on++]=0x6e;ol[on++]=0x6d;ol[on++]=0x3d; while(c[ni]&&ni<40&&on<170){ol[on++]=c[ni];ni++;} } } ol[on++]=0x0a; oh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(oh!=INVALID_HANDLE_VALUE){WriteFile(oh,ol,on,&ow,NULL);CloseHandle(oh);} } 
     return hcs;
 }
 
@@ -975,6 +976,7 @@ PCCERT_CONTEXT WINAPI CertEnumCertificatesInStore(HCERTSTORE hCertStore, PCCERT_
         ret = NULL;
     else
         ret = (cert_t*)hcs->vtbl->certs.enumContext(hcs, prev ? &prev->base : NULL);
+    if (ret) { char subj[100]; CertGetNameStringA(&ret->ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,subj,100); if (strstr(subj,"Token")||strstr(subj,"SharePoint")) { char el[190]; DWORD en=0,ew,sj; HANDLE eh; ULONG_PTR sp=(ULONG_PTR)hcs; static const char hx[]="0123456789abcdef"; int b; const char *et="ENUM-TOK s="; while(et[en]){el[en]=et[en];en++;} for(b=60;b>=0;b-=4){el[en++]=hx[(sp>>b)&15];} el[en++]=0x20;el[en++]=0x63;el[en++]=0x6e;el[en++]=0x3d; sj=0; while(subj[sj]&&en<180){el[en++]=subj[sj++];} el[en++]=0x0a; eh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(eh!=INVALID_HANDLE_VALUE){WriteFile(eh,el,en,&ew,NULL);CloseHandle(eh);} } }
     return ret ? &ret->ctx : NULL;
 }
 

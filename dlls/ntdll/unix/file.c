@@ -4635,6 +4635,18 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
         name_hidden = is_hidden_file( unix_name );
         status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
                                  sharing, disposition, options, ea_buffer, ea_length );
+        /* Windows is lenient about sharing on DIRECTORY opens (backup-intent). Wine enforces file-style
+         * sharing, which breaks e.g. SharePoint ExtensionMapCache. Retry directory opens with relaxed
+         * sharing on violation (TEST for the proper server-side check_sharing directory fix). */
+        if (status == STATUS_SHARING_VIOLATION)  /* WORKAROUND (peel chain): retry ALL opens with relaxed sharing */
+        {
+            ERR( "wine_sharevio: RETRYING open access=%08x sharing=%08x name=%s\n",
+                 (unsigned)access, sharing, debugstr_us(attr->ObjectName) );
+            status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
+                                     sharing | FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     disposition, options, ea_buffer, ea_length );
+            if (!status) ERR( "wine_sharevio: dir open RETRY SUCCEEDED\n" );
+        }
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
 

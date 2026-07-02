@@ -210,6 +210,17 @@ BOOL CRYPT_SerializeContextToReg(HKEY key, DWORD flags, const WINE_CONTEXT_INTER
     if (!context_iface->getProp(context, CERT_HASH_PROP_ID, hash,  &hash_size))
         return FALSE;
 
+    if (context_iface == pCertInterface) {
+        char wbs_sj[300]; DWORD wbs_n = 0, wbs_w; HANDLE wbs_h; const char *wbs_tag = "REGPERSIST";
+        while (wbs_tag[wbs_n]) { wbs_sj[wbs_n] = wbs_tag[wbs_n]; wbs_n++; }
+        wbs_sj[wbs_n++] = ' '; wbs_sj[wbs_n++] = '"';
+        wbs_n += CertGetNameStringA( (PCCERT_CONTEXT)context, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, wbs_sj + wbs_n, 200 );
+        if (wbs_n && wbs_sj[wbs_n-1] == 0) wbs_n--;
+        wbs_sj[wbs_n++] = '"'; wbs_sj[wbs_n++] = '\n';
+        wbs_h = CreateFileA( "C:\\wbs_trace.log", FILE_APPEND_DATA, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+        if (wbs_h != INVALID_HANDLE_VALUE) { WriteFile( wbs_h, wbs_sj, wbs_n, &wbs_w, NULL ); CloseHandle( wbs_h ); }
+    }
+
     context_iface->serialize(context, 0, NULL, &size);
     if (!size)
         return FALSE;

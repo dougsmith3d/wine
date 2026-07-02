@@ -284,7 +284,7 @@
 @ stdcall -import EqualDomainSid(ptr ptr ptr)
 @ stdcall -import EqualPrefixSid(ptr ptr)
 @ stdcall -import EqualSid(ptr ptr)
-# @ stub EventAccessControl
+@ stdcall EventAccessControl(ptr long ptr long long)
 # @ stub EventAccessQuery
 # @ stub EventAccessRemove
 @ stdcall EventActivityIdControl(long ptr) ntdll.EtwEventActivityIdControl

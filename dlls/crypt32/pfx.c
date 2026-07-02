@@ -17,18 +17,60 @@
  */
 
 #include <stdarg.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
 #include "wincrypt.h"
+#include "bcrypt.h"
+#include "ncrypt.h"
 #include "snmp.h"
 #include "crypt32_private.h"
 
+#include "wine/exception.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(crypt);
+
+static void wbs_trace_ctx( const char *tag, PCCERT_CONTEXT ctx )
+{
+    char buf[300]; DWORD n = 0, w; HANDLE h;
+    while (tag[n]) { buf[n] = tag[n]; n++; }
+    buf[n++] = ' '; buf[n++] = '"';
+    n += CertGetNameStringA( ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, buf + n, 200 );
+    if (n && buf[n-1] == 0) n--;
+    buf[n++] = '"'; buf[n++] = '\n';
+    h = CreateFileA( "C:\\wbs_trace.log", FILE_APPEND_DATA, FILE_SHARE_READ|FILE_SHARE_WRITE,
+                     NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    if (h != INVALID_HANDLE_VALUE) { WriteFile( h, buf, n, &w, NULL ); CloseHandle( h ); }
+}
+
+static void wbs_trace_str( const char *msg )
+{
+    char b[128]; DWORD n=0,w; HANDLE h;
+    while (msg[n] && n<120) { b[n]=msg[n]; n++; }
+    b[n++]='\n';
+    h=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (h!=INVALID_HANDLE_VALUE) { WriteFile(h,b,n,&w,NULL); CloseHandle(h); }
+}
+
+/* Build a process-unique key-container name for a PFX import.  Passing NULL to
+ * CryptAcquireContextW makes every machine-keyset import share the single default
+ * container, so importing several certs (a cert + its chain, or SharePoint's
+ * leaf+STS certs) clobbers earlier keys and breaks the cert<->key association.
+ * Windows assigns a unique container per import; mirror that. */
+static WCHAR *create_pfx_container_name(void)
+{
+    static LONG counter;
+    WCHAR *name = CryptMemAlloc( 64 * sizeof(WCHAR) );
+
+    if (name)
+        swprintf( name, 64, L"Wine-PFX-%08x-%08x-%08x", (unsigned)GetCurrentProcessId(),
+                  (unsigned)GetTickCount(), (unsigned)InterlockedIncrement( &counter ) );
+    return name;
+}
 
 static HCRYPTPROV import_key( cert_store_data_t data, DWORD flags )
 {
@@ -36,22 +78,26 @@ static HCRYPTPROV import_key( cert_store_data_t data, DWORD flags )
     HCRYPTKEY cryptkey;
     DWORD size, acquire_flags;
     void *key;
+    WCHAR *container;
     struct import_store_key_params params = { data, NULL, &size };
 
     if (CRYPT32_CALL( import_store_key, &params ) != STATUS_BUFFER_TOO_SMALL) return 0;
 
+    container = create_pfx_container_name();
     acquire_flags = (flags & CRYPT_MACHINE_KEYSET) | CRYPT_NEWKEYSET;
-    if (!CryptAcquireContextW( &prov, NULL, MS_ENHANCED_PROV_W, PROV_RSA_FULL, acquire_flags ))
+    if (!CryptAcquireContextW( &prov, container, MS_ENHANCED_PROV_W, PROV_RSA_FULL, acquire_flags ))
     {
-        if (GetLastError() != NTE_EXISTS) return 0;
+        if (GetLastError() != NTE_EXISTS) { CryptMemFree( container ); return 0; }
 
         acquire_flags &= ~CRYPT_NEWKEYSET;
-        if (!CryptAcquireContextW( &prov, NULL, MS_ENHANCED_PROV_W, PROV_RSA_FULL, acquire_flags ))
+        if (!CryptAcquireContextW( &prov, container, MS_ENHANCED_PROV_W, PROV_RSA_FULL, acquire_flags ))
         {
             WARN( "CryptAcquireContextW failed %08lx\n", GetLastError() );
+            CryptMemFree( container );
             return 0;
         }
     }
+    CryptMemFree( container );
 
     params.buf = key = CryptMemAlloc( size );
     if (CRYPT32_CALL( import_store_key, &params ) ||
@@ -176,10 +222,11 @@ HCERTSTORE WINAPI PFXImportCertStore( CRYPT_DATA_BLOB *pfx, const WCHAR *passwor
     {
         FIXME( "flag PKCS12_ALWAYS_CNG_KSP ignored\n" );
     }
-    if (CRYPT32_CALL( open_cert_store, &open_params )) return NULL;
+    ERR("WBSPFX PFXImportCertStore called pfx-size=%lu flags=%08lx\n", pfx->cbData, flags); wbs_trace_str("PFX-ENTRY");
+    if (CRYPT32_CALL( open_cert_store, &open_params )) { ERR("WBSPFX open_cert_store FAILED (bad PFX bytes - decryption?)\n"); wbs_trace_str("PFX-OPENFAIL"); return NULL; }
 
     prov = import_key( data, flags );
-    if (!prov) goto error;
+    if (!prov) { ERR("WBSPFX import_key FAILED\n"); wbs_trace_str("PFX-KEYFAIL"); goto error; }
 
     if (!(store = CertOpenStore( CERT_STORE_PROV_MEMORY, 0, 0, 0, NULL )))
     {
@@ -203,6 +250,7 @@ HCERTSTORE WINAPI PFXImportCertStore( CRYPT_DATA_BLOB *pfx, const WCHAR *passwor
             WARN( "CertCreateContext failed %08lx\n", GetLastError() );
             goto error;
         }
+        wbs_trace_ctx( "PFX-SUBJ", ctx );
         if (flags & PKCS12_NO_PERSIST_KEY)
         {
             if (!set_key_context( ctx, prov ))
@@ -229,6 +277,7 @@ HCERTSTORE WINAPI PFXImportCertStore( CRYPT_DATA_BLOB *pfx, const WCHAR *passwor
     }
     close_params.data = data;
     CRYPT32_CALL( close_cert_store, &close_params );
+    ERR("WBSPFX OK imported %lu cert(s) store=%p\n", i, store);
     return store;
 
 error:
@@ -243,6 +292,68 @@ BOOL WINAPI PFXVerifyPassword( CRYPT_DATA_BLOB *pfx, const WCHAR *password, DWOR
 {
     FIXME( "(%p, %p, %08lx): stub\n", pfx, password, flags );
     return FALSE;
+}
+
+
+#ifndef CERT_NCRYPT_KEY_SPEC
+#define CERT_NCRYPT_KEY_SPEC 0xffffffff
+#endif
+/* Export a CNG (NCrypt) RSA private key as a legacy CryptoAPI PRIVATEKEYBLOB, so a
+ * .NET/CNG-created cert can be written into a PFX (Wine bug: previously unimplemented). */
+static BYTE *export_cng_key_blob( NCRYPT_KEY_HANDLE key, DWORD *ret_size )
+{
+    BYTE *bcrypt_blob = NULL, *out = NULL, *dst;
+    const BYTE *pubexp, *modulus, *prime1, *prime2, *exp1, *exp2, *coeff, *privexp;
+    DWORD bcrypt_size = 0, out_size, modlen, primelen, i;
+    BCRYPT_RSAKEY_BLOB *rsa;
+    BLOBHEADER *hdr;
+    RSAPUBKEY *pk;
+    ULONG pe;
+
+    { SECURITY_STATUS st = STATUS_UNSUCCESSFUL;
+      __TRY { st = NCryptExportKey( key, 0, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, NULL, 0, &bcrypt_size, 0 ); }
+      __EXCEPT_PAGE_FAULT { WARN("bogus CNG key handle %p, exporting cert only\n",(void*)(ULONG_PTR)key); return NULL; }
+      __ENDTRY
+      if (st) return NULL; }
+    if (!(bcrypt_blob = CryptMemAlloc( bcrypt_size ))) return NULL;
+    if (NCryptExportKey( key, 0, BCRYPT_RSAFULLPRIVATE_BLOB, NULL, bcrypt_blob, bcrypt_size, &bcrypt_size, 0 )) goto done;
+    rsa = (BCRYPT_RSAKEY_BLOB *)bcrypt_blob;
+    if (rsa->Magic != BCRYPT_RSAFULLPRIVATE_MAGIC) goto done;
+    modlen   = rsa->cbModulus;
+    primelen = rsa->cbPrime1;
+    pubexp  = bcrypt_blob + sizeof(*rsa);
+    modulus = pubexp  + rsa->cbPublicExp;
+    prime1  = modulus + rsa->cbModulus;
+    prime2  = prime1  + rsa->cbPrime1;
+    exp1    = prime2  + rsa->cbPrime2;
+    exp2    = exp1    + rsa->cbPrime1;
+    coeff   = exp2    + rsa->cbPrime2;
+    privexp = coeff   + rsa->cbPrime1;
+    out_size = sizeof(BLOBHEADER) + sizeof(RSAPUBKEY) + 2*modlen + 5*primelen;
+    if (!(out = CryptMemAlloc( out_size ))) goto done;
+    hdr = (BLOBHEADER *)out;
+    hdr->bType    = PRIVATEKEYBLOB;
+    hdr->bVersion = CUR_BLOB_VERSION;
+    hdr->reserved = 0;
+    hdr->aiKeyAlg = CALG_RSA_KEYX;
+    pk = (RSAPUBKEY *)(hdr + 1);
+    pk->magic  = 0x32415352; /* RSA2 */
+    pk->bitlen = rsa->BitLength;
+    pe = 0;
+    for (i = 0; i < rsa->cbPublicExp; i++) pe = (pe << 8) | pubexp[i];
+    pk->pubexp = pe;
+    dst = (BYTE *)(pk + 1);
+    for (i = 0; i < modlen;   i++) *dst++ = modulus[modlen-1-i];
+    for (i = 0; i < primelen; i++) *dst++ = prime1[primelen-1-i];
+    for (i = 0; i < primelen; i++) *dst++ = prime2[primelen-1-i];
+    for (i = 0; i < primelen; i++) *dst++ = exp1[primelen-1-i];
+    for (i = 0; i < primelen; i++) *dst++ = exp2[primelen-1-i];
+    for (i = 0; i < primelen; i++) *dst++ = coeff[primelen-1-i];
+    for (i = 0; i < modlen;   i++) *dst++ = privexp[modlen-1-i];
+    *ret_size = out_size;
+done:
+    CryptMemFree( bcrypt_blob );
+    return out;
 }
 
 BOOL WINAPI PFXExportCertStore( HCERTSTORE store, CRYPT_DATA_BLOB *pfx, const WCHAR *password, DWORD flags )
@@ -275,11 +386,18 @@ BOOL WINAPI PFXExportCertStoreEx( HCERTSTORE store, CRYPT_DATA_BLOB *pfx, const 
     found = CertDuplicateCertificateContext( cert );
 
     /* Export the certificate's private key as a legacy MS PRIVATEKEYBLOB. */
+    wbs_trace_ctx( "PFX-EXPORT", found );
     if ((flags & EXPORT_PRIVATE_KEYS) &&
         CryptAcquireCertificatePrivateKey( found, CRYPT_ACQUIRE_SILENT_FLAG, NULL, &prov, &keyspec, &caller_free ))
     {
-        if (keyspec == 0xffffffff) /* CERT_NCRYPT_KEY_SPEC */
-            FIXME( "CNG private key export not supported, exporting cert only\n" );
+        if (keyspec == CERT_NCRYPT_KEY_SPEC)
+        {
+            if (!(key_blob = export_cng_key_blob( prov, &blob_size )))
+            {
+                WARN( "CNG private key export failed\n" );
+                blob_size = 0;
+            }
+        }
         else if (CryptGetUserKey( prov, keyspec, &hkey ) &&
                  CryptExportKey( hkey, 0, PRIVATEKEYBLOB, 0, NULL, &blob_size ) &&
                  (key_blob = CryptMemAlloc( blob_size )) &&

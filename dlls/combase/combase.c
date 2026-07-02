@@ -1443,6 +1443,8 @@ static BOOL guid_from_string(LPCWSTR s, GUID *id)
 
 static HRESULT clsid_from_string_reg(LPCOLESTR progid, CLSID *clsid)
 {
+    { HANDLE _f=CreateFileA("C:\\clsid_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,0,OPEN_ALWAYS,0,0);
+      if(_f!=INVALID_HANDLE_VALUE){ char _b[220]; int _n=0; const char*_t="CLSIDREQ "; while(_t[_n]){_b[_n]=_t[_n];_n++;} if(progid){DWORD _k;for(_k=0;progid[_k]&&_n<210;_k++)_b[_n++]=(char)progid[_k];} _b[_n++]=(char)10; DWORD _w; WriteFile(_f,_b,_n,&_w,0); CloseHandle(_f);} }
     WCHAR buf2[CHARS_IN_GUID];
     LONG buf2len = sizeof(buf2);
     HKEY xhkey;

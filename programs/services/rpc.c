@@ -986,6 +986,13 @@ DWORD __cdecl svcctl_ChangeServiceConfig2W( SC_RPC_HANDLE hService, SC_RPC_CONFI
         save_service_config( service->service_entry );
         service_unlock( service->service_entry );
         break;
+    case SERVICE_CONFIG_FAILURE_ACTIONS_FLAG:
+        service_lock( service->service_entry );
+        service->service_entry->failure_actions_flag =
+            config.actionsflag->fFailureActionsOnNonCrashFailures;
+        save_service_config( service->service_entry );
+        service_unlock( service->service_entry );
+        break;
     case SERVICE_CONFIG_SERVICE_SID_INFO:
         WINE_FIXME( "SERVICE_CONFIG_SERVICE_SID_INFO not implemented: type %lu\n",
                     config.sid->dwServiceSidType );
@@ -1061,6 +1068,20 @@ DWORD __cdecl svcctl_QueryServiceConfig2W( SC_RPC_HANDLE hService, DWORD level,
         else err = ERROR_INSUFFICIENT_BUFFER;
 
         service_unlock(service->service_entry);
+        break;
+
+    case SERVICE_CONFIG_FAILURE_ACTIONS:
+        /* report no failure actions configured (buffer already zeroed) */
+        *needed = sizeof(SERVICE_FAILURE_ACTIONSW);
+        if (size < *needed) err = ERROR_INSUFFICIENT_BUFFER;
+        break;
+
+    case SERVICE_CONFIG_FAILURE_ACTIONS_FLAG:
+        *needed = sizeof(SERVICE_FAILURE_ACTIONS_FLAG);
+        if (size >= *needed)
+            ((SERVICE_FAILURE_ACTIONS_FLAG *)buffer)->fFailureActionsOnNonCrashFailures =
+                service->service_entry->failure_actions_flag;
+        else err = ERROR_INSUFFICIENT_BUFFER;
         break;
 
     default:

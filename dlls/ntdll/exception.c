@@ -243,6 +243,132 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
      * info[0]=magic 0x19930520..22, info[2]=ThrowInfo*, info[3]=imagebase; ThrowInfo
      * +12 = pCatchableTypeArray RVA; array+4 = first CatchableType RVA; CT+4 = pType
      * RVA -> TypeDescriptor; TD+16 = mangled name. */
+    if (rec->ExceptionCode == 0xe0434352) {
+        MESSAGE("wine_mgd_throw tid=%04x np=%lu p0=%p p1=%p p2=%p\n",
+                (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, rec->NumberParameters,
+                (void*)rec->ExceptionInformation[0],
+                rec->NumberParameters>1?(void*)rec->ExceptionInformation[1]:(void*)0,
+                rec->NumberParameters>2?(void*)rec->ExceptionInformation[2]:(void*)0);
+        if ((unsigned)rec->ExceptionInformation[0] == 0x80131500 && context)  /* LockRecursionException: native stack-walk */
+        {
+            static int lockdumps;
+            if (lockdumps++ < 2)
+            {
+                CONTEXT c = *context;
+                unsigned int depth;
+                MESSAGE("wine_lockstk BEGIN tid=%04x\n", (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread);
+                for (depth = 0; depth < 45 && c.Rip; depth++)
+                {
+                    void *base = NULL;
+                    ULONG_PTR imgbase = 0;
+                    PVOID hdata; ULONG_PTR estframe;
+                    RUNTIME_FUNCTION *func;
+                    RtlPcToFileHeader((void *)c.Rip, &base);
+                    MESSAGE("wine_lockstk [%u] rip=%p mod=%p off=%p\n", depth, (void *)c.Rip, base,
+                            (void *)(base ? c.Rip - (ULONG_PTR)base : 0));
+                    func = RtlLookupFunctionEntry(c.Rip, &imgbase, NULL);
+                    if (!func) { c.Rip = *(ULONG_PTR *)c.Rsp; c.Rsp += 8; continue; }
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imgbase, c.Rip, func, &c, &hdata, &estframe, NULL);
+                }
+                MESSAGE("wine_lockstk END\n");
+            }
+        }
+        { static int mwalk;
+          if (mwalk++ < 30 && rec->NumberParameters == 5)
+          {
+              void *clrbase = NULL;
+              RtlPcToFileHeader((void *)rec->ExceptionInformation[4], &clrbase);
+              if (clrbase)
+              {
+                  void *(*getthr)(EXCEPTION_RECORD *) = (void *(*)(EXCEPTION_RECORD *))((char *)clrbase + 0x48b4a0);
+                  void *thr = getthr(rec);
+                  if (thr)
+                  {
+                      void *mt = *(void **)thr;
+                      void *msg = *(void **)((char *)thr + 0x20);
+                      if (msg && (ULONG_PTR)msg > 0x10000)
+                      {
+                          unsigned len = *(unsigned *)((char *)msg + 8);
+                          const WCHAR *ch = (const WCHAR *)((char *)msg + 0xc);
+                          if (len && len < 400)
+                          {
+                              MESSAGE("wine_exmsg: hr=%08x mt=%p msg=%.*ls\n",
+                                      (unsigned)rec->ExceptionInformation[0], mt, (int)len, ch);
+                              if (rec->ExceptionInformation[0] == 0x80131602)  /* ReflectionTypeLoadException: LoaderExceptions[0] */
+                              {
+                                  int lfo;
+                                  for (lfo = 0x18; lfo <= 0x68; lfo += 8)
+                                  {
+                                      void *arr = *(void **)((char *)thr + lfo);
+                                      if ((ULONG_PTR)arr > 0x10000)
+                                      {
+                                          unsigned alen = *(unsigned *)((char *)arr + 8);
+                                          if (alen > 0 && alen < 60)
+                                          {
+                                              void *e0 = *(void **)((char *)arr + 0x10);
+                                              if ((ULONG_PTR)e0 > 0x10000)
+                                              {
+                                                  void *em = *(void **)((char *)e0 + 0x20);
+                                                  if ((ULONG_PTR)em > 0x10000)
+                                                  {
+                                                      unsigned el = *(unsigned *)((char *)em + 8);
+                                                      const WCHAR *ec = (const WCHAR *)((char *)em + 0xc);
+                                                      if (el && el < 300 && ec[0] >= 0x20 && ec[0] < 0x7f)
+                                                          MESSAGE("wine_loaderex: [+0x%x] %.*ls\n", lfo, (int)el, ec);
+                                                  }
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                              /* CultureNotFoundException: dump _invalidCultureName / _invalidCultureId fields (probe 0x28..0x60) */
+                              if (len >= 8 && ch[0]==L'C' && ch[1]==L'u' && ch[2]==L'l')
+                              {
+                                  int fo;
+                                  for (fo = 0x28; fo <= 0x60; fo += 8)
+                                  {
+                                      void *fv = *(void **)((char *)thr + fo);
+                                      if ((ULONG_PTR)fv > 0x10000)
+                                      {
+                                          unsigned fl = *(unsigned *)((char *)fv + 8);
+                                          const WCHAR *fc = (const WCHAR *)((char *)fv + 0xc);
+                                          if (fl && fl < 80 && fc[0] >= 0x20 && fc[0] < 0x7f)
+                                              MESSAGE("wine_culf: [+0x%x] = %.*ls\n", fo, (int)fl, fc);
+                                      }
+                                      else if (fv && (ULONG_PTR)fv < 0x200000)
+                                          MESSAGE("wine_culf: [+0x%x] int=%p\n", fo, fv);
+                                  }
+                              }
+                          }
+                          else
+                              MESSAGE("wine_exmsg: hr=%08x mt=%p msglen=%u m18=%p m28=%p\n",
+                                      (unsigned)rec->ExceptionInformation[0], mt, len,
+                                      *(void**)((char*)thr+0x18), *(void**)((char*)thr+0x28));
+                      }
+                      else
+                          MESSAGE("wine_exmsg: hr=%08x mt=%p msg@20=%p m18=%p m28=%p m30=%p\n",
+                                  (unsigned)rec->ExceptionInformation[0], mt, msg,
+                                  *(void**)((char*)thr+0x18), *(void**)((char*)thr+0x28), *(void**)((char*)thr+0x30));
+                  }
+              }
+          }
+        }
+        { static int mgddumps;
+          if ((unsigned)rec->ExceptionInformation[0]==0x80070057 && context && mgddumps++ < 3) {
+            CONTEXT c = *context; unsigned d;
+            for (d=0; d<24 && c.Rip; d++) {
+                void *base=NULL; RtlPcToFileHeader((void*)c.Rip,&base);
+                MESSAGE("wine_mgd_uw [%u] rip=%p mod=%p off=%p\n", d,(void*)c.Rip,base,(void*)(base?(ULONG_PTR)c.Rip-(ULONG_PTR)base:0));
+                { ULONG_PTR imgbase=0, establisher=0; void *hd=0;
+                  RUNTIME_FUNCTION *func=RtlLookupFunctionEntry(c.Rip,&imgbase,NULL);
+                  if(!func){ c.Rip=*(ULONG_PTR*)c.Rsp; c.Rsp+=8; }
+                  else { KNONVOLATILE_CONTEXT_POINTERS ptrs={{0}};
+                         RtlVirtualUnwind(UNW_FLAG_NHANDLER,imgbase,c.Rip,func,&c,&hd,&establisher,&ptrs);
+                         if(!c.Rip) break; } }
+            }
+          }
+        }
+    }
     if (rec->ExceptionCode == 0xe06d7363 && rec->NumberParameters >= 4 &&
         (rec->ExceptionInformation[0] & ~3) == 0x19930520 && rec->ExceptionInformation[3])
     {
@@ -258,7 +384,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                 {
                     const char *tn = (const char *)(base + (unsigned int)ct[1] + 16);
                     MESSAGE( "wine_cxx_throw tid=%04x type=%s\n", (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, tn );
-                    if (strstr( tn, "HRException" ) || strstr( tn, "Vstatus" ) || strstr( tn, "genericStatus" ))
+                    if (strstr(tn,"HRException")) { const unsigned int *ho=(const unsigned int *)rec->ExceptionInformation[1]; int k;
+                        if (ho) for (k=2;k<20;k++){ unsigned int v=ho[k]; if((v>>28)==8 && (v&0x0fff0000)!=0) MESSAGE("wine_hr: HRESULT[+0x%x]=0x%08x\n",k*4,v); } }
+                    if (0) /* decoder disabled */
                     {
                         const unsigned int *obj = (const unsigned int *)rec->ExceptionInformation[1];
                         if (obj)
@@ -267,8 +395,8 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                             MESSAGE( "wine_sp_fix: %s obj dw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                                      strstr(tn,"Vstatus")?"Vstatus":strstr(tn,"genericStatus")?"VgenStatus":"HRException",
                                      obj[0],obj[1],obj[2],obj[3],obj[4],obj[5],obj[6],obj[7] );
-                            if (d0) MESSAGE( "wine_sp_fix:   *obj[0] dw: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                                             d0[0],d0[1],d0[2],d0[3],d0[4],d0[5],d0[6],d0[7] );
+                            if (d0) MESSAGE( "wine_sp_fix:   *obj[0] dw: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                             d0[0],d0[1],d0[2],d0[3],d0[4],d0[5],d0[6],d0[7],d0[8],d0[9],d0[10],d0[11],d0[12],d0[13],d0[14],d0[15] );
                             if (d0)
                             {
                                 ULONG_PTR pp; const WCHAR *w;
@@ -276,17 +404,42 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                                 if (w) MESSAGE( "wine_sp_fix:   ptrA -> w%.80ls\n", w );
                                 pp = ((const ULONG_PTR *)d0)[3]; w = (const WCHAR *)pp;
                                 if (w) MESSAGE( "wine_sp_fix:   ptrB -> w%.80ls\n", w );
+                                if (strstr(tn,"MessageException")) {
+                                    { unsigned int len = d0[6]; const WCHAR *iw = (const WCHAR *)&d0[7];
+                                      if (len > 0 && len < 80 && iw[0] >= 0x20 && iw[0] < 0x7f)
+                                          MESSAGE("wine_sp_fix:   EEMsg INLINE len=%u -> w%.*ls\n", len, (int)len, iw); }
+                                    const ULONG_PTR *o64 = (const ULONG_PTR *)obj; int i;
+                                    for (i = 1; i < 12; i++) {
+                                        ULONG_PTR pv = o64[i];
+                                        if (pv > 0x10000 && pv < (ULONG_PTR)0x7fffffffffffULL && !(pv & 1)) {
+                                            const WCHAR *ws = (const WCHAR *)pv;
+                                            if (ws[0] >= 0x20 && ws[0] < 0x7f && ws[1] >= 0x20 && ws[1] < 0x7f)
+                                                MESSAGE("wine_sp_fix:   EEMsg o[%d] -> w%.120ls\n", i, ws);
+                                        }
+                                        if (d0) { pv = ((const ULONG_PTR *)d0)[i];
+                                        if (pv > 0x10000 && pv < (ULONG_PTR)0x7fffffffffffULL && !(pv & 1)) {
+                                            const WCHAR *ws = (const WCHAR *)pv;
+                                            if (ws[0] >= 0x20 && ws[0] < 0x7f && ws[1] >= 0x20 && ws[1] < 0x7f)
+                                                MESSAGE("wine_sp_fix:   EEMsg d[%d] -> w%.120ls\n", i, ws);
+                                        } }
+                                    }
+                                }
                             }
                             if (strstr(tn,"HRException"))
                             {
                                 const WCHAR *w = (const WCHAR *)(d0 ? (const void*)&d0[5] : (const void*)0);
                                 if (w) MESSAGE( "wine_sp_fix:   HRExc str: w%.80ls\n", w );
+                                { const unsigned int *ho = (const unsigned int *)obj; int k;
+                                  for (k=2; k<16; k++) {
+                                      unsigned int v = ho[k];
+                                      if ((v>>28)==8 && (v&0x0fff0000)!=0)
+                                          MESSAGE("wine_sp_fix:   HRExc HRESULT[+0x%x]=0x%08x\n", k*4, v); } }
                             }
                         }
                     }
                     /* For the SharePoint Vstatus culprit, do a PROPER x64 stack unwind and
                      * resolve each return address to module+offset (RtlPcToFileHeader). */
-                    static int hrdumps; if (tn[0] && context && (strstr(tn,"Vstatus") || (strstr(tn,"HRException") && hrdumps++ < 3)))
+                    static int hrdumps; static int msgdumps; if (tn[0] && context && (strstr(tn,"Vstatus") || ((strstr(tn,"HRException")||strstr(tn,"EEException")) && hrdumps++ < 4) || (strstr(tn,"MessageException") && msgdumps++ < 6)))
                     {
                         CONTEXT c = *context;
                         unsigned int depth;

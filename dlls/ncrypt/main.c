@@ -379,6 +379,11 @@ SECURITY_STATUS WINAPI NCryptFinalizeKey(NCRYPT_KEY_HANDLE handle, DWORD flags)
         return map_ntstatus(status);
     }
 
+    /* sync the public-key-length property to the actual (post-finalize) key length;
+     * it was set to a default at create time and .NET re-reads it to validate the
+     * cached ephemeral key -- a stale value makes RSACng regenerate on every access. */
+    set_object_property(object, BCRYPT_PUBLIC_KEY_LENGTH, (BYTE *)&key_length, sizeof(key_length));
+
     persist_key_to_legacy_csp(object);
 
     return ERROR_SUCCESS;
@@ -608,8 +613,84 @@ BOOL WINAPI NCryptIsKeyHandle(NCRYPT_KEY_HANDLE hKey)
 SECURITY_STATUS WINAPI NCryptOpenKey(NCRYPT_PROV_HANDLE provider, NCRYPT_KEY_HANDLE *key,
                                      const WCHAR *name, DWORD keyspec, DWORD flags)
 {
-    FIXME("(%#Ix, %p, %s, %#lx, %#lx): stub\n", provider, key, wine_dbgstr_w(name), keyspec, flags);
-    return NTE_NOT_SUPPORTED;
+    struct object *object;
+    HCRYPTPROV prov = 0;
+    HCRYPTKEY hkey = 0;
+    BYTE *blob = NULL;
+    DWORD blob_len = 0, acquire = 0;
+    NTSTATUS status;
+
+    FIXME("(%#Ix, %p, %s, %#lx, %#lx): loading persisted key from legacy CSP\n", provider,
+          key, wine_dbgstr_w(name), keyspec, flags);
+
+    if (!provider) return NTE_INVALID_HANDLE;
+    if (!key || !name) return NTE_INVALID_PARAMETER;
+
+    if (flags & 0x00000020 /* NCRYPT_MACHINE_KEY_FLAG */) acquire |= CRYPT_MACHINE_KEYSET;
+    if (!CryptAcquireContextW(&prov, name, NULL, PROV_RSA_FULL, acquire) &&
+        !CryptAcquireContextW(&prov, name, NULL, PROV_RSA_FULL,
+                              acquire ? 0 : CRYPT_MACHINE_KEYSET))
+    {
+        /* Not an RSA legacy container: treat as a named CNG KDF key (e.g. IIS
+         * iisCngWasKey), a persisted SP800-108 CTR-HMAC secret used with
+         * NCryptKeyDerivation. Wine BCryptKeyDerivation supports SP800108_CTR_HMAC.
+         * Use the container name as the (consistent) secret so create and open
+         * yield the same key. */
+        BCRYPT_ALG_HANDLE kdf = NULL;
+        BCRYPT_KEY_HANDLE bk = NULL;
+        DWORD name_len = lstrlenW(name) * sizeof(WCHAR);
+        if (!BCryptOpenAlgorithmProvider(&kdf, L"SP800_108_CTR_HMAC", NULL, 0) &&
+            !BCryptGenerateSymmetricKey(kdf, &bk, NULL, 0, (UCHAR *)name, name_len, 0))
+        {
+            struct object *kobj = allocate_object(KEY);
+            if (kobj)
+            {
+                kobj->key.bcrypt_key = bk;
+                set_object_property(kobj, NCRYPT_NAME_PROPERTY, (BYTE *)name,
+                                    name_len + sizeof(WCHAR));
+                *key = (NCRYPT_KEY_HANDLE)kobj;
+                return ERROR_SUCCESS;
+            }
+            BCryptDestroyKey(bk);
+        }
+        return NTE_BAD_KEYSET;
+    }
+
+    if (!CryptGetUserKey(prov, AT_KEYEXCHANGE, &hkey) &&
+        !CryptGetUserKey(prov, AT_SIGNATURE, &hkey))
+    {
+        CryptReleaseContext(prov, 0);
+        return NTE_BAD_KEYSET;
+    }
+    if (!CryptExportKey(hkey, 0, PRIVATEKEYBLOB, 0, NULL, &blob_len) ||
+        !(blob = malloc(blob_len)) ||
+        !CryptExportKey(hkey, 0, PRIVATEKEYBLOB, 0, blob, &blob_len))
+    {
+        free(blob);
+        CryptDestroyKey(hkey);
+        CryptReleaseContext(prov, 0);
+        return NTE_BAD_KEY;
+    }
+    CryptDestroyKey(hkey);
+    CryptReleaseContext(prov, 0);
+
+    if (!(object = create_key_object(RSA, provider)))
+    {
+        free(blob);
+        return NTE_NO_MEMORY;
+    }
+    status = BCryptImportKeyPair(BCRYPT_RSA_ALG_HANDLE, NULL, LEGACY_RSAPRIVATE_BLOB,
+                                &object->key.bcrypt_key, blob, blob_len, 0);
+    free(blob);
+    if (status != STATUS_SUCCESS)
+    {
+        free(object);
+        return map_ntstatus(status);
+    }
+    set_object_property(object, NCRYPT_NAME_PROPERTY, (BYTE *)name,
+                        (lstrlenW(name) + 1) * sizeof(WCHAR));
+    *key = (NCRYPT_KEY_HANDLE)object;
+    return ERROR_SUCCESS;
 }
 
 SECURITY_STATUS WINAPI NCryptOpenStorageProvider(NCRYPT_PROV_HANDLE *provider, const WCHAR *name, DWORD flags)
@@ -672,4 +753,18 @@ SECURITY_STATUS WINAPI NCryptVerifySignature(NCRYPT_KEY_HANDLE handle, void *pad
 
     return map_ntstatus(BCryptVerifySignature(key_object->key.bcrypt_key, padding, hash, hash_size, signature,
                                               signature_size, flags));
+}
+SECURITY_STATUS WINAPI NCryptKeyDerivation(NCRYPT_KEY_HANDLE key, NCryptBufferDesc *params,
+                                           PUCHAR derived, DWORD derived_size, DWORD *result, ULONG flags)
+{
+    struct object *object = (struct object *)key;
+    NTSTATUS status;
+
+    FIXME("(%#Ix, %p, %p, %lu, %p, %#lx): wrapping BCryptKeyDerivation\n", key, params, derived,
+          derived_size, result, flags);
+
+    if (!object) return NTE_INVALID_HANDLE;
+    status = BCryptKeyDerivation(object->key.bcrypt_key, (BCryptBufferDesc *)params, derived,
+                                 derived_size, (ULONG *)result, flags);
+    return map_ntstatus(status);
 }

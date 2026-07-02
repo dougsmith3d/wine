@@ -865,6 +865,19 @@ BOOL WINAPI CertStrToNameW(DWORD dwCertEncodingType, LPCWSTR pszX500,
     {
         if (ppszError)
             *ppszError = NULL;
+        /* CERT_NAME_STR_REVERSE_FLAG: RDNs in the string are in reverse order
+         * from the encoding; reverse rgRDN before encoding so the DER RDN
+         * sequence matches Windows (fixes .NET X509 FindBySubjectDistinguishedName). */
+        if ((dwStrType & CERT_NAME_STR_REVERSE_FLAG) && info.cRDN > 1)
+        {
+            DWORD lo, hi;
+            for (lo = 0, hi = info.cRDN - 1; lo < hi; lo++, hi--)
+            {
+                CERT_RDN tmp = info.rgRDN[lo];
+                info.rgRDN[lo] = info.rgRDN[hi];
+                info.rgRDN[hi] = tmp;
+            }
+        }
         ret = CryptEncodeObjectEx(dwCertEncodingType, X509_NAME, &info,
          0, NULL, pbEncoded, pcbEncoded);
     }

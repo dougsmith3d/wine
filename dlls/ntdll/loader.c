@@ -1743,6 +1743,7 @@ static int sp_findkey_thunk( void *thisp, void *key, void *out )
 {
     int r = sp_real_findkey( thisp, key, out );
     unsigned int g0 = 0; unsigned short w2 = 0, w3 = 0; int ok = 0;
+    if ((ULONG_PTR)key > 0x10000) /* FKGUARD: skip bogus non-pointer keys (e.g. 1) that AV */
     __TRY
     {
         const unsigned int *g = (const unsigned int *)key;
@@ -1848,7 +1849,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
      * not-yet-ready state at load cannot harm the process. Offset is for this build. */
     if (reason == DLL_PROCESS_ATTACH && status == STATUS_SUCCESS &&
         wm->ldr.BaseDllName.Length >= 12 * sizeof(WCHAR) &&
-        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"onetutil.dll", 12 ))
+        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"onetutil.dll", 12 ) && 0)
     {
         void *(CDECL *init_atomizer)(void) = (void *)((char *)module + 0xeb4c);
         MESSAGE( "wine_sp_fix: onetutil base=%p\n", module );
@@ -1871,7 +1872,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
 
     if (reason == DLL_PROCESS_ATTACH && status == STATUS_SUCCESS &&
         wm->ldr.BaseDllName.Length >= 10 * sizeof(WCHAR) &&
-        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"stswel.dll", 10 ))
+        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"stswel.dll", 10 ) && 0)
     {
         MESSAGE( "wine_sp_fix: stswel base=%p\n", module );
         {
@@ -1930,7 +1931,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
 
     if (reason == DLL_PROCESS_ATTACH && status == STATUS_SUCCESS && sp_owssvr_base == NULL &&
         wm->ldr.BaseDllName.Length >= 10 * sizeof(WCHAR) &&
-        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"owssvr.dll", 10 ))
+        !wcsnicmp( wm->ldr.BaseDllName.Buffer, L"owssvr.dll", 10 ) && 0)
     {
         sp_owssvr_base = module;
         MESSAGE( "wine_sp_fix: owssvr base=%p\n", module );
@@ -1938,7 +1939,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved 
         {
             BYTE *p = (BYTE *)module + 0x158480;
             static const BYTE o[2] = { 0x0f,0x85 };
-            static const int sp_v14_off = 0; /* v14 ON: skip the deadlocking em-registration */
+            static const int sp_v14_off = 1; /* byte-patch OFF: rely on clean SRWLock fix */
             if (sp_v14_off) MESSAGE("wine_sp_fix: v14 DISABLED for test (deadlock will return)\n");
             else if (!memcmp(p,o,2)) {
                 BYTE r6[6] = { 0xe9,0x69,0x01,0x00,0x00,0x90 };

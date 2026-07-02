@@ -64,6 +64,7 @@ struct service_entry
     BOOL marked_for_delete;
     BOOL is_wow64;
     BOOL delayed_autostart;
+    BOOL failure_actions_flag;
     struct list handles;
 };
 

@@ -613,6 +613,19 @@ BOOL WINAPI CheckTokenMembership( HANDLE token, PSID sid_to_check, PBOOL is_memb
     }
 
 exit:
+    {
+        PUCHAR _nsa = GetSidSubAuthorityCount((PSID)sid_to_check);
+        if (_nsa && *_nsa == 2 && *GetSidSubAuthority((PSID)sid_to_check,0)==32
+                && *GetSidSubAuthority((PSID)sid_to_check,1)==544)
+        {
+            HANDLE _h = CreateFileW(L"C:\\wbs_trace.log", FILE_APPEND_DATA,
+                FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
+            if (_h != INVALID_HANDLE_VALUE) {
+                const char *_m = (*is_member) ? "CHECKTOKEN admin m=1\r\n" : "CHECKTOKEN admin m=0\r\n";
+                DWORD _w; WriteFile(_h, _m, 22, &_w, NULL); CloseHandle(_h);
+            }
+        }
+    }
     HeapFree(GetProcessHeap(), 0, token_groups);
     if (thread_token != NULL) CloseHandle(thread_token);
     return ret;

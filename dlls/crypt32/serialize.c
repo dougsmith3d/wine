@@ -134,7 +134,8 @@ static BOOL CRYPT_SerializeStoreElement(const void *context,
         ret = TRUE;
         do {
             prop = contextInterface->enumProps(context, prop);
-            if (prop && (!omitHashes || !IS_CERT_HASH_PROP_ID(prop)))
+            if (prop && (!omitHashes || !IS_CERT_HASH_PROP_ID(prop)) &&
+                 prop != CERT_NCRYPT_KEY_HANDLE_PROP_ID)
             {
                 DWORD propSize = 0;
 
@@ -173,7 +174,8 @@ static BOOL CRYPT_SerializeStoreElement(const void *context,
             prop = 0;
             do {
                 prop = contextInterface->enumProps(context, prop);
-                if (prop && (!omitHashes || !IS_CERT_HASH_PROP_ID(prop)))
+                if (prop && (!omitHashes || !IS_CERT_HASH_PROP_ID(prop)) &&
+                 prop != CERT_NCRYPT_KEY_HANDLE_PROP_ID)
                 {
                     DWORD propSize = 0;
 

@@ -47,9 +47,10 @@
 
 int get_inproc_device_fd(void)
 {
-    static int fd = -2;
-    if (fd == -2) fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );
-    return fd;
+    /* SharePoint-under-Wine: disable in-proc (ntsync) syncs - this tree has a bug where the server
+     * release_mutex is called for an inproc mutex (asserts). Force out-of-proc syncs (like older Wine).
+     * TODO upstream: fix the inproc mutex release path instead. */
+    return -1;
 }
 
 struct inproc_sync

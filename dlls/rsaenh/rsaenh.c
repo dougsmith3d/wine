@@ -1253,8 +1253,7 @@ static BOOL open_container_key(LPCSTR pszContainerName, DWORD dwFlags, REGSAM ac
 
     /* @@ Wine registry key: HKLM\Software\Wine\Crypto\RSA */
     /* @@ Wine registry key: HKCU\Software\Wine\Crypto\RSA */
-    return RegOpenKeyExA(hRootKey, szRSABase, 0, access, phKey) ==
-                         ERROR_SUCCESS;
+    { BOOL _ok = (RegOpenKeyExA(hRootKey, szRSABase, 0, access, phKey) == ERROR_SUCCESS); char rl[180]; DWORD rn=0,rw,rj; HANDLE rh; const char *rt="RSAENH-OPEN ctr="; while(rt[rn]){rl[rn]=rt[rn];rn++;} rj=0; if(pszContainerName){while(pszContainerName[rj]&&rn<150){rl[rn++]=pszContainerName[rj++];}} rl[rn++]=0x20; rl[rn++]=0x72; rl[rn++]=0x3d; rl[rn++]=_ok?0x31:0x30; rl[rn++]=0x0a; rh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(rh!=INVALID_HANDLE_VALUE){WriteFile(rh,rl,rn,&rw,NULL);CloseHandle(rh);} return _ok; }
 }
 
 /******************************************************************************
@@ -1298,6 +1297,7 @@ static void store_key_container_keys(KEYCONTAINER *pKeyContainer)
 {
     HKEY hKey;
     DWORD dwFlags;
+    { char rl[170]; DWORD rn=0,rw,rj; HANDLE rh; const char *rt="RSAENH-STORE ctr="; while(rt[rn]){rl[rn]=rt[rn];rn++;} rj=0; if(pKeyContainer->szName){while(pKeyContainer->szName[rj]&&rn<150){rl[rn++]=pKeyContainer->szName[rj++];}} rl[rn++]=0x0a; rh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(rh!=INVALID_HANDLE_VALUE){WriteFile(rh,rl,rn,&rw,NULL);CloseHandle(rh);} }
 
     /* On WinXP, persistent keys are stored in a file located at:
      * $AppData$\\Microsoft\\Crypto\\RSA\\$SID$\\some_hex_string
@@ -4329,17 +4329,22 @@ BOOL WINAPI RSAENH_CPGetProvParam(HCRYPTPROV hProv, DWORD dwParam, BYTE *pbData,
         {
             SECURITY_DESCRIPTOR *sd;
             DWORD err, len, flags = (pKeyContainer->dwFlags & CRYPT_MACHINE_KEYSET);
+            REGSAM sec_access = KEY_READ;
+            if (dwFlags & SACL_SECURITY_INFORMATION) sec_access |= ACCESS_SYSTEM_SECURITY;
+            { char gl[160]; DWORD gn=0,gw,gj; HANDLE gh; const char *gt="WBSGSEC-ENTER cn="; while(gt[gn]){gl[gn]=gt[gn];gn++;} gj=0; if(pKeyContainer->szName){while(pKeyContainer->szName[gj]&&gn<150){gl[gn++]=pKeyContainer->szName[gj++];}} gl[gn++]=0x0a; gh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(gh!=INVALID_HANDLE_VALUE){WriteFile(gh,gl,gn,&gw,NULL);CloseHandle(gh);} }
 
-            if (!open_container_key(pKeyContainer->szName, flags, KEY_READ, &hKey))
+            if (!open_container_key(pKeyContainer->szName, flags, sec_access, &hKey))
             {
                 SetLastError(NTE_BAD_KEYSET);
                 return FALSE;
             }
 
+            ERR("WBSGSEC opened ok, pre-GetSecurityInfo dwFlags=%08lx\n", dwFlags);
             err = GetSecurityInfo(hKey, SE_REGISTRY_KEY, dwFlags, NULL, NULL, NULL, NULL, (void **)&sd);
             RegCloseKey(hKey);
             if (err)
             {
+                ERR("WBSGSEC GetSecurityInfo FAILED err=%lu dwFlags=%08lx\n", err, dwFlags);
                 SetLastError(err);
                 return FALSE;
             }
@@ -4350,6 +4355,7 @@ BOOL WINAPI RSAENH_CPGetProvParam(HCRYPTPROV hProv, DWORD dwParam, BYTE *pbData,
             *pdwDataLen = len;
 
             LocalFree(sd);
+            { char gl[160]; DWORD gn=0,gw,gj; HANDLE gh; const char *gt="WBSGSEC-OK cn="; while(gt[gn]){gl[gn]=gt[gn];gn++;} gj=0; if(pKeyContainer->szName){while(pKeyContainer->szName[gj]&&gn<150){gl[gn++]=pKeyContainer->szName[gj++];}} gl[gn++]=0x0a; gh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(gh!=INVALID_HANDLE_VALUE){WriteFile(gh,gl,gn,&gw,NULL);CloseHandle(gh);} }
             return TRUE;
         }
 
@@ -4875,9 +4881,14 @@ BOOL WINAPI RSAENH_CPSetProvParam(HCRYPTPROV hProv, DWORD dwParam, BYTE *pbData,
         REGSAM access = WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY;
         PSID owner = NULL, group = NULL;
         PACL dacl = NULL, sacl = NULL;
+        { char gl[160]; DWORD gn=0,gw,gj; HANDLE gh; const char *gt="WBSKSEC-FT cn="; while(gt[gn]){gl[gn]=gt[gn];gn++;} gj=0; if(pKeyContainer->szName){while(pKeyContainer->szName[gj]&&gn<150){gl[gn++]=pKeyContainer->szName[gj++];}} gl[gn++]=0x0a; gh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(gh!=INVALID_HANDLE_VALUE){WriteFile(gh,gl,gn,&gw,NULL);CloseHandle(gh);} }
 
+        ERR("WBSKSEC enter container=%s dwFlags=%08lx machine=%08lx\n", debugstr_a(pKeyContainer->szName), dwFlags, flags);
+            { char kl[160]; DWORD kn=0,kw,kj=0; HANDLE kh; const char *kt="KSEC-ENTER cn="; while(kt[kn]){kl[kn]=kt[kn];kn++;} while(pKeyContainer->szName[kj]&&kn<150){kl[kn++]=pKeyContainer->szName[kj++];} kl[kn++]=13;kl[kn++]=10; kh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL); if(kh!=INVALID_HANDLE_VALUE){WriteFile(kh,kl,kn,&kw,NULL);CloseHandle(kh);} }
         if (!open_container_key(pKeyContainer->szName, flags, access, &hKey))
         {
+            ERR("WBSKSEC open_container_key FAILED container=%s\n", debugstr_a(pKeyContainer->szName));
+            { char kl[160]; DWORD kn=0,kw,kj=0; HANDLE kh; const char *kt="KSEC-OPENFAIL cn="; while(kt[kn]){kl[kn]=kt[kn];kn++;} while(pKeyContainer->szName[kj]&&kn<150){kl[kn++]=pKeyContainer->szName[kj++];} kl[kn++]=13;kl[kn++]=10; kh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL); if(kh!=INVALID_HANDLE_VALUE){WriteFile(kh,kl,kn,&kw,NULL);CloseHandle(kh);} }
             SetLastError(NTE_BAD_KEYSET);
             return FALSE;
         }
@@ -4887,6 +4898,7 @@ BOOL WINAPI RSAENH_CPSetProvParam(HCRYPTPROV hProv, DWORD dwParam, BYTE *pbData,
             (dwFlags & DACL_SECURITY_INFORMATION && !GetSecurityDescriptorDacl(sd, &present, &dacl, &def)) ||
             (dwFlags & SACL_SECURITY_INFORMATION && !GetSecurityDescriptorSacl(sd, &present, &sacl, &def)))
         {
+            ERR("WBSKSEC GetSecurityDescriptor* FAILED\n");
             RegCloseKey(hKey);
             return FALSE;
         }
@@ -4895,9 +4907,13 @@ BOOL WINAPI RSAENH_CPSetProvParam(HCRYPTPROV hProv, DWORD dwParam, BYTE *pbData,
         RegCloseKey(hKey);
         if (err)
         {
+            ERR("WBSKSEC SetSecurityInfo FAILED err=%lu container=%s\n", err, debugstr_a(pKeyContainer->szName));
+            { char kl[160]; DWORD kn=0,kw,kj=0; HANDLE kh; const char *kt="KSEC-SETFAIL cn="; while(kt[kn]){kl[kn]=kt[kn];kn++;} while(pKeyContainer->szName[kj]&&kn<150){kl[kn++]=pKeyContainer->szName[kj++];} kl[kn++]=13;kl[kn++]=10; kh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL); if(kh!=INVALID_HANDLE_VALUE){WriteFile(kh,kl,kn,&kw,NULL);CloseHandle(kh);} }
             SetLastError(err);
             return FALSE;
         }
+        ERR("WBSKSEC OK container=%s\n", debugstr_a(pKeyContainer->szName));
+            { char kl[160]; DWORD kn=0,kw,kj=0; HANDLE kh; const char *kt="KSEC-OK cn="; while(kt[kn]){kl[kn]=kt[kn];kn++;} while(pKeyContainer->szName[kj]&&kn<150){kl[kn++]=pKeyContainer->szName[kj++];} kl[kn++]=13;kl[kn++]=10; kh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,0,NULL); if(kh!=INVALID_HANDLE_VALUE){WriteFile(kh,kl,kn,&kw,NULL);CloseHandle(kh);} }
         return TRUE;
     }
     default:

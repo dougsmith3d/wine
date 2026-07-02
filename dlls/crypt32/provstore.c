@@ -97,6 +97,14 @@ static BOOL ProvStore_addCert(WINECRYPT_CERTSTORE *store, context_t *cert,
         if (ret)
             ret = ps->memStore->vtbl->certs.addContext(ps->memStore, cert, NULL,
              ppStoreContext, TRUE);
+        /* Commit to the backing store immediately (write-through), as Windows
+         * does.  The provider writes back lazily on close, but the close is
+         * deferred whenever the caller still holds enumerated contexts (they
+         * reference the store), leaving an added cert invisible to a fresh
+         * in-process reopen -- which breaks add-then-look-up-in-the-same-process
+         * (e.g. SharePoint installing a cert then binding to it). */
+        if (ret && ps->provControl)
+            ps->provControl(ps->hStoreProv, 0, CERT_STORE_CTRL_COMMIT, NULL);
     }
     /* dirty trick: replace the returned context's hCertStore with
      * store.

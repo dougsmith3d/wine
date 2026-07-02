@@ -32,6 +32,7 @@
 #include "ncrypt.h"
 #include "winnls.h"
 #include "rpc.h"
+#include <string.h>
 #include "wine/debug.h"
 #include "crypt32_private.h"
 
@@ -167,12 +168,22 @@ static const context_vtbl_t cert_vtbl = {
     Cert_clone
 };
 
+/* HACK-REGISTER scaffold: cache SharePoint STS cert contexts so a find by thumbprint
+ * always succeeds even after SharePoint clears/reorders its cert store, to get psconfig
+ * past the STS-binding wall and expose deeper layers.  NOT a shipping fix. */
+struct wbs_cached_cert { BYTE *bytes; DWORD len; BYTE hash[20]; };
+static struct wbs_cached_cert wbs_cache[256];
+static int wbs_cache_n;
+int wbs_join_phase;  /* set by regstore when SPFarm.Join clears the store */
+static int wbs_in_add_check;  /* true while add_cert_to_store probes for an existing copy */
+
 static BOOL add_cert_to_store(WINECRYPT_CERTSTORE *store, const CERT_CONTEXT *cert,
  DWORD add_disposition, BOOL use_link, PCCERT_CONTEXT *ret_context)
 {
     const CERT_CONTEXT *existing = NULL;
     BOOL ret = TRUE, inherit_props = FALSE;
     context_t *new_context = NULL;
+    { char al[200]; DWORD an=0,aw; HANDLE ah; static const char hx[]="0123456789abcdef"; const char *at="ADDENTRY t="; while(at[an]){al[an]=at[an];an++;} al[an++]=(store&&((WINECRYPT_CERTSTORE*)store)->type<4)?"MCPE"[((WINECRYPT_CERTSTORE*)store)->type]:0x3f; al[an++]=0x20; al[an++]=0x64; al[an++]=0x3d; al[an++]=hx[(add_disposition>>4)&15]; al[an++]=hx[add_disposition&15]; al[an++]=0x20; al[an++]=0x63; al[an++]=0x6e; al[an++]=0x3d; an+=CertGetNameStringA(cert,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,al+an,110); if(an&&al[an-1]==0)an--; al[an++]=0x0a; ah=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(ah!=INVALID_HANDLE_VALUE){WriteFile(ah,al,an,&aw,NULL);CloseHandle(ah);} }
 
     switch (add_disposition)
     {
@@ -194,8 +205,10 @@ static BOOL add_cert_to_store(WINECRYPT_CERTSTORE *store, const CERT_CONTEXT *ce
         {
             CRYPT_HASH_BLOB blob = { sizeof(hashToAdd), hashToAdd };
 
+            wbs_in_add_check = 1;
             existing = CertFindCertificateInStore(store, cert->dwCertEncodingType, 0,
              CERT_FIND_SHA1_HASH, &blob, NULL);
+            wbs_in_add_check = 0;
         }
         break;
     }
@@ -204,6 +217,8 @@ static BOOL add_cert_to_store(WINECRYPT_CERTSTORE *store, const CERT_CONTEXT *ce
         SetLastError(E_INVALIDARG);
         return FALSE;
     }
+
+    { char al[200]; DWORD an=0,aw; HANDLE ah; const char *at="ADDPROBE exist="; while(at[an]){al[an]=at[an];an++;} al[an++]=existing?0x31:0x30; al[an++]=0x20; al[an++]=0x63; al[an++]=0x6e; al[an++]=0x3d; an+=CertGetNameStringA(cert,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,al+an,110); if(an&&al[an-1]==0)an--; al[an++]=0x0a; ah=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(ah!=INVALID_HANDLE_VALUE){WriteFile(ah,al,an,&aw,NULL);CloseHandle(ah);} }
 
     switch (add_disposition)
     {
@@ -270,6 +285,63 @@ static BOOL add_cert_to_store(WINECRYPT_CERTSTORE *store, const CERT_CONTEXT *ce
         return TRUE;
     }
 
+    {
+        static const char wbs_hx[]="0123456789abcdef";
+        BYTE wbs_h[20]; DWORD wbs_hl=20, wbs_i, wbs_sl; char wbs_b[64], wbs_cn[128], wbs_sn[64];
+        if (CertGetCertificateContextProperty(cert, CERT_SHA1_HASH_PROP_ID, wbs_h, &wbs_hl)) {
+            for(wbs_i=0;wbs_i<wbs_hl&&wbs_i<20;wbs_i++){wbs_b[wbs_i*2]=wbs_hx[wbs_h[wbs_i]>>4];wbs_b[wbs_i*2+1]=wbs_hx[wbs_h[wbs_i]&0xf];}
+            wbs_b[wbs_hl*2]=0;
+            wbs_cn[0]=0; CertGetNameStringA(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, wbs_cn, sizeof(wbs_cn));
+            wbs_sl = cert->pCertInfo->SerialNumber.cbData; if(wbs_sl>20) wbs_sl=20;
+            for(wbs_i=0;wbs_i<wbs_sl;wbs_i++){ BYTE wbs_sb=cert->pCertInfo->SerialNumber.pbData[wbs_sl-1-wbs_i]; wbs_sn[wbs_i*2]=wbs_hx[wbs_sb>>4]; wbs_sn[wbs_i*2+1]=wbs_hx[wbs_sb&0xf]; }
+            wbs_sn[wbs_sl*2]=0;
+            ERR("WBSADD sha1=%s cbEnc=%lu cn=\"%s\" serial=%s disp=%lu store=%p\n", wbs_b, cert->cbCertEncoded, wbs_cn, wbs_sn, add_disposition, store);
+        {
+            char al[300]; DWORD an=0, aw, aj, ab; HANDLE ah;
+            ULONG_PTR sp=(ULONG_PTR)store;
+            static const char hx[]="0123456789abcdef";
+            const char *at="ADD-STORE cn=";
+            while(at[an]){ al[an]=at[an]; an++; }
+            aj=0; while(wbs_cn[aj] && an<150){ al[an++]=wbs_cn[aj++]; }
+            al[an++]=' '; al[an++]='s'; al[an++]='=';
+            for(ab=15; ; ab--){ al[an++]=hx[(sp>>(ab*4))&15]; if(ab==0) break; }
+            al[an++]=' '; al[an++]='t'; al[an++]='='; al[an++]=(store->type<4)?"MCPE"[store->type]:'\x3f';
+            al[an++]=' '; al[an++]='h'; al[an++]='='; aj=0; while(wbs_b[aj] && an<260){ al[an++]=wbs_b[aj++]; }
+            al[an++]='\n';
+            ah=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+            if(ah!=INVALID_HANDLE_VALUE){ WriteFile(ah,al,an,&aw,NULL); CloseHandle(ah); }
+        }
+            {
+                static int wbs_sts_dumped = 0;
+                if (!wbs_sts_dumped && strstr(wbs_cn, "Token Service")) {
+                    HANDLE _t = CreateFileA("C:\\dump_trigger", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                    if (_t != INVALID_HANDLE_VALUE) CloseHandle(_t);
+                    wbs_sts_dumped = 1;
+                    Sleep(8000);
+                }
+            }
+            if (strstr(wbs_cn, "SharePoint") && wbs_cache_n < 256)
+            {
+                int wbs_k, wbs_dup = 0;
+                for (wbs_k = 0; wbs_k < wbs_cache_n; wbs_k++)
+                    if (!memcmp(wbs_cache[wbs_k].hash, wbs_h, 20)) { wbs_dup = 1; break; }
+                if (!wbs_dup && (wbs_cache[wbs_cache_n].bytes = CryptMemAlloc(cert->cbCertEncoded)))
+                {
+                    memcpy(wbs_cache[wbs_cache_n].bytes, cert->pbCertEncoded, cert->cbCertEncoded);
+                    wbs_cache[wbs_cache_n].len = cert->cbCertEncoded;
+                    memcpy(wbs_cache[wbs_cache_n].hash, wbs_h, 20);
+                    wbs_cache_n++;
+                }
+            }
+            {
+                static int wbs_staging;
+                /* HACK-REGISTER scaffold2: stage SharePoint STS certs into the machine
+                 * "SharePoint" store as soon as they are generated, so the IIS binding that
+                 * references them (committed before the real install) can find them. */
+                (void)wbs_staging; /* scaffold2 stage-on-add disabled (suspected AccessViolation cause) */
+            }
+        }
+    }
     ret = store->vtbl->certs.addContext(store, context_from_ptr(cert), existing ? context_from_ptr(existing) : NULL,
      (ret_context || inherit_props) ? &new_context : NULL, use_link);
     if(!ret)
@@ -806,6 +878,8 @@ static BOOL CertContext_SetProperty(cert_t *cert, DWORD dwPropId,
             }
             break;
         case CERT_KEY_PROV_INFO_PROP_ID:
+            { char kl[170]; DWORD kn=0,kw; HANDLE kh; const char *kt="KEYBIND-PROVINFO cn=\""; while(kt[kn]){kl[kn]=kt[kn];kn++;} kn+=CertGetNameStringA(&cert->ctx,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,kl+kn,110); if(kn&&kl[kn-1]==0)kn--; kl[kn++]=0x22; kl[kn++]=0x0a; kh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(kh!=INVALID_HANDLE_VALUE){WriteFile(kh,kl,kn,&kw,NULL);CloseHandle(kh);} }
+            if(pvData){ const CRYPT_KEY_PROV_INFO *pi=pvData; char cl[220]; DWORD cn2=0,cw2; HANDLE ch2; const char *ctg="PROVINFO-CTR ["; while(ctg[cn2]){cl[cn2]=ctg[cn2];cn2++;} if(pi->pwszContainerName){ const WCHAR *w=pi->pwszContainerName; DWORD wi=0; while(w[wi]&&wi<90){cl[cn2++]=(char)(w[wi]&0xff); wi++;} } cl[cn2++]=0x5d; cl[cn2++]=0x20; cl[cn2++]=0x6b; cl[cn2++]=0x73; cl[cn2++]=0x3d; cl[cn2++]=(char)(0x30+(pi->dwKeySpec&7)); cl[cn2++]=0x20; cl[cn2++]=0x70; cl[cn2++]=0x74; cl[cn2++]=0x3d; cl[cn2++]=(char)(0x30+(pi->dwProvType&15)); cl[cn2++]=0x20; cl[cn2++]=0x66; cl[cn2++]=0x6c; cl[cn2++]=0x3d; { DWORD fv=pi->dwFlags; int sh; static const char hx2[]="0123456789abcdef"; for(sh=28;sh>=0;sh-=4){cl[cn2++]=hx2[(fv>>sh)&15];} } cl[cn2++]=0x0a; ch2=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(ch2!=INVALID_HANDLE_VALUE){WriteFile(ch2,cl,cn2,&cw2,NULL);CloseHandle(ch2);} }
             if (pvData)
                 ret = CertContext_SetKeyProvInfoProperty(cert->base.properties, pvData);
             else
@@ -838,6 +912,24 @@ static BOOL CertContext_SetProperty(cert_t *cert, DWORD dwPropId,
              0, &keyContext);
             break;
         }
+        case CERT_NCRYPT_KEY_HANDLE_PROP_ID:
+            { char kl[170]; DWORD kn=0,kw; HANDLE kh; const char *kt="KEYBIND-NCRYPT cn=\""; while(kt[kn]){kl[kn]=kt[kn];kn++;} kn+=CertGetNameStringA(&cert->ctx,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,kl+kn,110); if(kn&&kl[kn-1]==0)kn--; kl[kn++]=0x22; kl[kn++]=0x0a; kh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(kh!=INVALID_HANDLE_VALUE){WriteFile(kh,kl,kn,&kw,NULL);CloseHandle(kh);} }
+            /* .NET CreateSelfSigned associates the CNG private key with the cert by
+             * setting this property; store the handle so the set succeeds (was a stub
+             * returning FALSE -> CryptographicException). */
+            if (pvData)
+            {
+                /* wine fix: for CERT_NCRYPT_KEY_HANDLE_PROP_ID pvData IS the key handle,
+                 * not a pointer to it - store the handle value itself */
+                ret = ContextPropertyList_SetProperty(cert->base.properties, dwPropId,
+                 (const BYTE *)&pvData, sizeof(pvData));
+            }
+            else
+            {
+                ContextPropertyList_RemoveProperty(cert->base.properties, dwPropId);
+                ret = TRUE;
+            }
+            break;
         default:
             FIXME("%ld: stub\n", dwPropId);
             ret = FALSE;
@@ -1003,18 +1095,27 @@ BOOL WINAPI CryptAcquireCertificatePrivateKey(PCCERT_CONTEXT pCert,
     else if (dwFlags & CRYPT_ACQUIRE_CACHE_FLAG)
         cache = TRUE;
     *phCryptProv = 0;
-    if (cache)
+    if (1) /* wine fix: use the cert cached key context, or an ephemeral CNG key handle attached to it */
     {
         size = sizeof(keyContext);
-        ret = CertGetCertificateContextProperty(pCert, CERT_KEY_CONTEXT_PROP_ID,
-         &keyContext, &size);
-        if (ret)
+        if (CertGetCertificateContextProperty(pCert, CERT_KEY_CONTEXT_PROP_ID, &keyContext, &size))
         {
+            ret = TRUE;
             *phCryptProv = keyContext.hCryptProv;
-            if (pdwKeySpec)
-                *pdwKeySpec = keyContext.dwKeySpec;
-            if (pfCallerFreeProv)
-                *pfCallerFreeProv = FALSE;
+            if (pdwKeySpec) *pdwKeySpec = keyContext.dwKeySpec;
+            if (pfCallerFreeProv) *pfCallerFreeProv = FALSE;
+        }
+        else
+        {
+            HCRYPTPROV_OR_NCRYPT_KEY_HANDLE ncrypt_key = 0;
+            size = sizeof(ncrypt_key);
+            if (CertGetCertificateContextProperty(pCert, CERT_NCRYPT_KEY_HANDLE_PROP_ID, &ncrypt_key, &size) && ncrypt_key)
+            {
+                ret = TRUE;
+                *phCryptProv = ncrypt_key;
+                if (pdwKeySpec) *pdwKeySpec = 0xffffffff; /* CERT_NCRYPT_KEY_SPEC */
+                if (pfCallerFreeProv) *pfCallerFreeProv = FALSE;
+            }
         }
     }
     if (!*phCryptProv)
@@ -1046,6 +1147,7 @@ BOOL WINAPI CryptAcquireCertificatePrivateKey(PCCERT_CONTEXT pCert,
     CryptMemFree(info);
     if (cert_in_store)
         CertFreeCertificateContext(cert_in_store);
+    { char al[200]; DWORD an=0,aw; HANDLE ah; const char *at="ACQPRIVKEY ret="; while(at[an]){al[an]=at[an];an++;} al[an++]=ret?0x31:0x30; al[an++]=0x20; al[an++]=0x63; al[an++]=0x6e; al[an++]=0x3d; al[an++]=0x22; an+=CertGetNameStringA(pCert,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,al+an,120); if(an&&al[an-1]==0)an--; al[an++]=0x22; al[an++]=0x20; al[an++]=0x73; al[an++]=0x6e; al[an++]=0x3d; { static const char shx[]="0123456789abcdef"; DWORD si; CRYPT_INTEGER_BLOB *sb=&pCert->pCertInfo->SerialNumber; for(si=0; si<sb->cbData && si<20 && an<190; si++){ al[an++]=shx[(sb->pbData[si]>>4)&15]; al[an++]=shx[sb->pbData[si]&15]; } } al[an++]=0x0a; ah=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(ah!=INVALID_HANDLE_VALUE){WriteFile(ah,al,an,&aw,NULL);CloseHandle(ah);} }
     if (ret) SetLastError(0);
     return ret;
 }
@@ -1921,8 +2023,56 @@ PCCERT_CONTEXT WINAPI CertFindCertificateInStore(HCERTSTORE hCertStore,
          compare, dwType, dwFlags, pvPara);
     else
         ret = NULL;
+    if (0 && !ret && !wbs_in_add_check && dwType == 0x10000 && pvPara) /* fallback disabled: no lab-only variant works (see onion) */
+    {
+        const CRYPT_HASH_BLOB *hb = pvPara; int wbs_k;
+        if (hb->cbData == 20)
+            for (wbs_k = 0; wbs_k < wbs_cache_n; wbs_k++)
+                if (!memcmp(wbs_cache[wbs_k].hash, hb->pbData, 20))
+                {
+                    /* Make the cached SharePoint cert a GENUINE member of the searched store,
+                     * then re-find it -> a real context (valid vtbl/u.ptr), not a synthesized
+                     * one that crashes consumers.  wbs_in_add_check guards re-entry. */
+                    PCCERT_CONTEXT wbs_tmp = CertCreateCertificateContext(X509_ASN_ENCODING, wbs_cache[wbs_k].bytes, wbs_cache[wbs_k].len);
+                    if (wbs_tmp)
+                    {
+                        wbs_in_add_check = 1;
+                        CertAddCertificateContextToStore(hCertStore, wbs_tmp, CERT_STORE_ADD_REPLACE_EXISTING, NULL);
+                        CertFreeCertificateContext(wbs_tmp);
+                        ret = CertFindCertificateInStore(hCertStore, dwCertEncodingType, 0, dwType, pvPara, NULL);
+                        wbs_in_add_check = 0;
+                        ERR("WBS find-fallback: staged real cert into store, re-find=%p\n", ret);
+                    }
+                    break;
+                }
+    }
     if (!ret)
+    {
+        static const char wbs_hx[] = "0123456789abcdef";
+        DWORD wbs_n = 0, wbs_i; PCCERT_CONTEXT wbs_c = NULL;
+        while ((wbs_c = CertEnumCertificatesInStore(hCertStore, wbs_c))) wbs_n++;
+        ERR("WBSFIND null dwType=%08lx dwFlags=%08lx store-cert-count=%lu\n", dwType, dwFlags, wbs_n);
+        if (dwType == 0x10000 /* CERT_FIND_SHA1_HASH */ && pvPara && wbs_n)
+        {
+            { static int wbs_dt=0; if(!wbs_dt){ wbs_dt=1; HANDLE _t=CreateFileA("C:\\dump_trigger",GENERIC_WRITE,0,NULL,CREATE_ALWAYS,0,NULL); if(_t!=INVALID_HANDLE_VALUE)CloseHandle(_t); Sleep(12000);} }
+            const CRYPT_HASH_BLOB *hb = pvPara; char buf[64]; DWORD m = hb->cbData < 20 ? hb->cbData : 20;
+            for (wbs_i = 0; wbs_i < m; wbs_i++){ buf[wbs_i*2]=wbs_hx[hb->pbData[wbs_i]>>4]; buf[wbs_i*2+1]=wbs_hx[hb->pbData[wbs_i]&0xf]; }
+            buf[m*2]=0; ERR("WBSFIND want-sha1=%s cb=%lu\n", buf, hb->cbData);
+            { char wl[80]; DWORD wn=0,ww,wj=0; HANDLE wh; const char*wt="FIND-WANT "; while(wt[wn]){wl[wn]=wt[wn];wn++;} while(buf[wj]){wl[wn++]=buf[wj++];} wl[wn++]='\n'; wh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(wh!=INVALID_HANDLE_VALUE){WriteFile(wh,wl,wn,&ww,NULL);CloseHandle(wh);} }
+            wbs_c = NULL;
+            while ((wbs_c = CertEnumCertificatesInStore(hCertStore, wbs_c)))
+            {
+                BYTE h[20]; DWORD hl = 20; char sx[64];
+                if (CertGetCertificateContextProperty(wbs_c, CERT_SHA1_HASH_PROP_ID, h, &hl))
+                {
+                    for (wbs_i = 0; wbs_i < hl && wbs_i < 20; wbs_i++){ sx[wbs_i*2]=wbs_hx[h[wbs_i]>>4]; sx[wbs_i*2+1]=wbs_hx[h[wbs_i]&0xf]; }
+                    sx[hl*2]=0; ERR("WBSFIND have-sha1=%s len=%lu\n", sx, wbs_c->cbCertEncoded);
+                    { char hl2[80]; DWORD hn=0,hw,hj=0; HANDLE hh; const char*ht="FIND-HAVE "; while(ht[hn]){hl2[hn]=ht[hn];hn++;} while(sx[hj]){hl2[hn++]=sx[hj++];} hl2[hn++]='\n'; hh=CreateFileA("C:\\wbs_trace.log",FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL); if(hh!=INVALID_HANDLE_VALUE){WriteFile(hh,hl2,hn,&hw,NULL);CloseHandle(hh);} }
+                }
+            }
+        }
         SetLastError(CRYPT_E_NOT_FOUND);
+    }
     TRACE("returning %p\n", ret);
     return ret;
 }

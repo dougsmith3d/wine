@@ -378,6 +378,18 @@ HRESULT WINAPI SetErrorInfo(ULONG reserved, IErrorInfo *error_info)
 
     TRACE("%lu, %p\n", reserved, error_info);
 
+    if (error_info)
+    {
+        static int einfolog;
+        if (einfolog++ < 20)
+        {
+            BSTR desc = NULL, src = NULL;
+            IErrorInfo_GetDescription(error_info, &desc);
+            IErrorInfo_GetSource(error_info, &src);
+            MESSAGE("wine_errinfo: src=%s desc=%s\n", src ? debugstr_w(src) : "(null)", desc ? debugstr_w(desc) : "(null)");
+        }
+    }
+
     if (reserved)
         return E_INVALIDARG;
 

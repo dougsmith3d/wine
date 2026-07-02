@@ -740,3 +740,16 @@ ULONG WINAPI EnumerateTraceGuidsEx(TRACE_QUERY_INFO_CLASS class, void *in, ULONG
     *ret_len = 0;
     return ERROR_INVALID_PARAMETER;
 }
+
+/***********************************************************************
+ *  EventAccessControl  (ADVAPI32.@)
+ *
+ * Controls the security (SDDL/ACL) on an ETW provider or session. Wine's ETW
+ * is a no-op, so grant/deny is not enforced; return success so callers that
+ * secure their trace session (e.g. SharePoint SPDiagnosticsService) proceed.
+ */
+ULONG WINAPI EventAccessControl( GUID *guid, ULONG operation, PSID sid, ULONG rights, BOOLEAN allow )
+{
+    FIXME( "(%s, %lu, %p, %#lx, %d): stub\n", debugstr_guid(guid), operation, sid, rights, allow );
+    return ERROR_SUCCESS;
+}

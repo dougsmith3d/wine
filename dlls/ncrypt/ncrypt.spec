@@ -79,7 +79,7 @@
 @ stdcall NCryptImportKey(long long wstr ptr ptr ptr long long)
 @ stdcall NCryptIsAlgSupported(long wstr long)
 @ stdcall NCryptIsKeyHandle(long)
-@ stub NCryptKeyDerivation
+@ stdcall NCryptKeyDerivation(ptr ptr ptr long ptr long)
 @ stub NCryptNotifyChangeKey
 @ stdcall NCryptOpenKey(long ptr wstr long long)
 @ stub NCryptOpenKeyProtector
