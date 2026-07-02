@@ -249,7 +249,7 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                 (void*)rec->ExceptionInformation[0],
                 rec->NumberParameters>1?(void*)rec->ExceptionInformation[1]:(void*)0,
                 rec->NumberParameters>2?(void*)rec->ExceptionInformation[2]:(void*)0);
-        if ((unsigned)rec->ExceptionInformation[0] == 0x80131500)  /* LockRecursionException: write a full-memory minidump for SOS */
+        if ((unsigned)rec->ExceptionInformation[0] == 0x99999999)  /* DISABLED old dump trigger; use msg-matched below minidump for SOS */
         {
             static int dumped;
             if (!dumped)
@@ -332,6 +332,30 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
                           {
                               MESSAGE("wine_exmsg: hr=%08x mt=%p msg=%.*ls\n",
                                       (unsigned)rec->ExceptionInformation[0], mt, (int)len, ch);
+                              if (len>=9 && ch[0]=='R'&&ch[1]=='e'&&ch[2]=='c'&&ch[3]=='u'&&ch[4]=='r'&&ch[5]=='s'&&ch[6]=='i'&&ch[7]=='v'&&ch[8]=='e') {
+                                  static int rdumped;
+                                  if (!rdumped) { rdumped=1;
+                                      __TRY {
+                                          UNICODE_STRING us2; HMODULE dbg2=NULL;
+                                          RtlInitUnicodeString(&us2, L"dbghelp.dll");
+                                          if (!LdrLoadDll(NULL,0,&us2,(void**)&dbg2) && dbg2) {
+                                              ANSI_STRING as2; BOOL (WINAPI *mdwd2)(HANDLE,ULONG,HANDLE,ULONG,void*,void*,void*)=NULL;
+                                              RtlInitAnsiString(&as2,"MiniDumpWriteDump");
+                                              LdrGetProcedureAddress(dbg2,&as2,0,(void**)&mdwd2);
+                                              if (mdwd2) {
+                                                  UNICODE_STRING p2; OBJECT_ATTRIBUTES oa2; IO_STATUS_BLOCK io2; HANDLE fh2=NULL;
+                                                  RtlInitUnicodeString(&p2, L"\\??\\C:\\lockrec2.dmp");
+                                                  InitializeObjectAttributes(&oa2,&p2,OBJ_CASE_INSENSITIVE,NULL,NULL);
+                                                  if (!NtCreateFile(&fh2,GENERIC_WRITE|SYNCHRONIZE,&oa2,&io2,NULL,FILE_ATTRIBUTE_NORMAL,0,FILE_OVERWRITE_IF,FILE_SYNCHRONOUS_IO_NONALERT,NULL,0)) {
+                                                      BOOL ok2 = mdwd2(NtCurrentProcess(),(ULONG)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess,fh2,0x2,NULL,NULL,NULL);
+                                                      NtClose(fh2);
+                                                      MESSAGE("wine_recdump: ok=%d -> C:\\lockrec2.dmp\n", ok2);
+                                                  } else MESSAGE("wine_recdump: NtCreateFile failed\n");
+                                              }
+                                          }
+                                      } __EXCEPT_ALL { MESSAGE("wine_recdump: FAULTED\n"); } __ENDTRY
+                                  }
+                              }
                               if (rec->ExceptionInformation[0] == 0x80131602)  /* ReflectionTypeLoadException: LoaderExceptions[0] */
                               {
                                   int lfo;
