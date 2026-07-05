@@ -2368,83 +2368,30 @@ static RUNTIME_FUNCTION *raw_lookup_function_entry( ULONG_PTR pc, ULONG_PTR *bas
     return NULL;
 }
 
-/* 0 = observe-only (still buggy, just LOG cross-pass divergences); 1 = apply the fix. */
-#define PALATE_HT_FIX 0
-
 /**********************************************************************
  *              RtlLookupFunctionEntry   (NTDLL.@)
  *
- * Windows caches every resolved (pc -> ImageBase, RUNTIME_FUNCTION) into the caller-supplied
- * UNWIND_HISTORY_TABLE and returns the SAME pointer on a subsequent hit. The CLR's two-pass
- * funclet EH depends on this: RtlDispatchException builds one history table for the SEARCH pass,
- * and the CLR personality forwards that same table into RtlUnwindEx for the UNWIND pass, so every
- * frame resolves to an identical snapshot across both passes even while another thread concurrently
- * installs/removes/regrows a dynamic (JIT) function table. Wine ignored the table entirely, so under
- * concurrent .NET JIT the unwind pass could resolve a frame's pc to a DIFFERENT RUNTIME_FUNCTION than
- * the search pass did; the CLR then drove its unwind into a frame for which pass 1 recorded no catch,
- * read a NULL catch-funclet PC from its ExceptionTracker and executed `call *0` (clr+0x1a38d8) -> an
- * uncatchable AV -> iisexpress died. Only under load, only on Wine.
+ * NB: a prior experiment implemented Windows-style UNWIND_HISTORY_TABLE caching here on the theory
+ * that the CLR's two-pass funclet EH needed a consistent (pc -> RUNTIME_FUNCTION) snapshot across the
+ * search and unwind passes. That theory was REFUTED by its own instrumentation: the cache-vs-fresh
+ * "divergence" probe fired ~15700 times across ~490 threads while the process died only ~13 times, so
+ * lookup divergence is ubiquitous and (almost always) harmless -- not the crash signal. Worse, the
+ * cached entries were garbage (one ImageBase mapped to 889 distinct RUNTIME_FUNCTION pointers): the
+ * CLR's GetRuntimeFunctionCallback hands back a volatile per-thread scratch RUNTIME_FUNCTION that is
+ * overwritten on the next call, so storing that pointer in the history table dangles. Re-resolving on
+ * every cache hit also called that callback an EXTRA time, clobbering the scratch a concurrent unwind
+ * was mid-read -- an actively perturbing measurement. Reverted to the stock behaviour (ignore the
+ * caller's history table, resolve uncached each time) so measurements are uncontaminated.
  */
 PRUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *base,
                                                  UNWIND_HISTORY_TABLE *table )
 {
-    RUNTIME_FUNCTION *func;
-
 #ifdef __arm64ec__
     if (RtlIsEcCode( pc ))
         return (RUNTIME_FUNCTION *)RtlLookupFunctionEntry_arm64( pc, base, table );
 #endif
 
-    if (table)
-    {
-        DWORD i;
-
-        for (i = 0; i < table->Count && i < UNWIND_HISTORY_TABLE_SIZE; i++)
-        {
-            func = table->Entry[i].FunctionEntry;
-            if (!func) continue;
-            if (pc <  table->Entry[i].ImageBase + func->BeginAddress) continue;
-            if (pc >= table->Entry[i].ImageBase + func->EndAddress) continue;
-
-            /* Cache hit. Re-resolve uncached and compare: a mismatch is precisely the cross-pass
-             * divergence that only Windows' history-table caching hides. This is the smoking gun. */
-            {
-                ULONG_PTR fresh_base = 0;
-                RUNTIME_FUNCTION *fresh = raw_lookup_function_entry( pc, &fresh_base );
-
-                if (!fresh || fresh_base != table->Entry[i].ImageBase ||
-                    fresh->BeginAddress != func->BeginAddress ||
-                    fresh->EndAddress   != func->EndAddress   ||
-                    fresh->UnwindData   != func->UnwindData)
-                {
-                    ERR( "PALATE-HT cross-pass divergence pc=%p cached{base=%Ix rf=%p b=%x e=%x u=%x} "
-                         "fresh{base=%Ix rf=%p b=%x e=%x u=%x}\n", (void *)pc,
-                         table->Entry[i].ImageBase, func, func->BeginAddress, func->EndAddress,
-                         func->UnwindData, fresh_base, fresh,
-                         fresh ? fresh->BeginAddress : 0, fresh ? fresh->EndAddress : 0,
-                         fresh ? fresh->UnwindData : 0 );
-                }
-#if PALATE_HT_FIX
-                *base = table->Entry[i].ImageBase;
-                return func;
-#else
-                /* observe-only: keep today's (buggy) behaviour so the crash still reproduces */
-                *base = fresh_base;
-                return fresh;
-#endif
-            }
-        }
-    }
-
-    func = raw_lookup_function_entry( pc, base );
-
-    if (func && table && table->Count < UNWIND_HISTORY_TABLE_SIZE)
-    {
-        table->Entry[table->Count].ImageBase     = *base;
-        table->Entry[table->Count].FunctionEntry = func;
-        table->Count++;
-    }
-    return func;
+    return raw_lookup_function_entry( pc, base );
 }
 
 
