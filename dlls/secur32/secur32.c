@@ -1215,3 +1215,32 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
 
     return TRUE;
 }
+
+/***********************************************************************
+ *              SeciAllocateAndSetIPAddress (SECUR32.@)
+ *
+ * Undocumented helper used by IIS http auth (authsspi.dll) to record the
+ * client IP address for a security context. Allocate a blob and return it
+ * so callers that dereference the out pointer do not fault.
+ */
+SECURITY_STATUS WINAPI SeciAllocateAndSetIPAddress(void *addr, ULONG addr_len, DWORD *out)
+{
+    /* authsspi passes a SOCKADDR + its length and a 4-byte out flag; it only tests
+     * *out != 0 (then calls SeciFreeCallContext). Writing an 8-byte pointer here
+     * overran the DWORD slot and corrupted the stack for clients that supply an IP. */
+    TRACE("(%p, %u, %p)\n", addr, addr_len, out);
+    if (out) *out = 1;
+    return SEC_E_OK;
+}
+
+/***********************************************************************
+ *              SeciFreeCallContext (SECUR32.@)
+ *
+ * Frees a call context blob allocated by SeciAllocateAndSetIPAddress.
+ */
+SECURITY_STATUS WINAPI SeciFreeCallContext(void *ctx)
+{
+    /* No heap object was allocated (the out value is just a flag); nothing to free. */
+    TRACE("(%p)\n", ctx);
+    return SEC_E_OK;
+}

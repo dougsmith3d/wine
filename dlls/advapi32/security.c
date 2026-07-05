@@ -983,17 +983,19 @@ LookupAccountSidW(
        which is exactly what SharePoint's admin service (WSSADMIN) OnStart does. */
     {
         WCHAR *sidstr = NULL;
+        WCHAR comp[MAX_COMPUTERNAME_LENGTH + 1];
+        DWORD complen = ARRAY_SIZE(comp);
+        if (!GetComputerNameW( comp, &complen )) { comp[0] = 0; complen = 0; }
         if (ConvertSidToStringSidW( sid, &sidstr ) && sidstr)
         {
-            DWORD ac_len = lstrlenW(sidstr) + 1, dm_len = 1;
+            DWORD ac_len = lstrlenW(sidstr), dm_len = complen;
             BOOL status = TRUE;
             if ((*accountSize && *accountSize < ac_len) || (!account && !*accountSize && ac_len) ||
                 (*domainSize && *domainSize < dm_len)   || (!domain && !*domainSize && dm_len))
             { SetLastError(ERROR_INSUFFICIENT_BUFFER); status = FALSE; }
-            if (status) { if (account) lstrcpyW(account, sidstr); if (domain) domain[0] = 0; }
+            if (status) { if (account) lstrcpyW(account, sidstr); if (domain) lstrcpyW(domain, comp); }
             *domainSize  = *domainSize  ? dm_len : dm_len + 1;
             *accountSize = *accountSize ? ac_len : ac_len + 1;
-            MESSAGE( "wine_lsa_dbg: LookupAccountSidW SYNTH name=%s status=%d\n", debugstr_w(sidstr), status );
             LocalFree(sidstr);
             if (status) *name_use = SidTypeAlias;
             return status;

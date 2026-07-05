@@ -1017,6 +1017,13 @@ static NTSTATUS NTAPI ntlm_SpAcceptLsaModeContext( LSA_SEC_HANDLE cred_handle, L
                 goto done;
             }
         }
+        {
+            unsigned int _i;
+            for (_i = 0; _i < sizeof(ctx->username) - 1 && buf[3 + _i] && buf[3 + _i] != '\n' && buf[3 + _i] != '\r'; _i++)
+                ctx->username[_i] = buf[3 + _i];
+            ctx->username[_i] = 0;
+            TRACE( "authenticated user %s\n", debugstr_a(ctx->username) );
+        }
         output->pBuffers[0].cbBuffer = 0;
 
         strcpy( buf, "GF" );
@@ -1115,9 +1122,24 @@ static NTSTATUS NTAPI ntlm_SpQueryContextAttributes( LSA_SEC_HANDLE handle, ULON
     X(SECPKG_ATTR_AUTHORITY);
     X(SECPKG_ATTR_DCE_INFO);
     X(SECPKG_ATTR_LIFESPAN);
-    X(SECPKG_ATTR_NAMES);
+    case SECPKG_ATTR_NAMES:
+    {
+        struct ntlm_ctx *nctx = (struct ntlm_ctx *)handle;
+        SecPkgContext_NamesW *names = (SecPkgContext_NamesW *)buf;
+        unsigned int _i, _n = 0;
+        while (nctx->username[_n]) _n++;
+        if (!(names->sUserName = RtlAllocateHeap( GetProcessHeap(), 0, (_n + 1) * sizeof(WCHAR) )))
+            return SEC_E_INSUFFICIENT_MEMORY;
+        for (_i = 0; _i <= _n; _i++) names->sUserName[_i] = (unsigned char)nctx->username[_i];
+        return SEC_E_OK;
+    }
     X(SECPKG_ATTR_NATIVE_NAMES);
-    X(SECPKG_ATTR_PACKAGE_INFO);
+    case SECPKG_ATTR_PACKAGE_INFO:
+    {
+        SecPkgContext_PackageInfoW *info = (SecPkgContext_PackageInfoW *)buf;
+        if (!(info->PackageInfo = build_package_info( &ntlm_package_info ))) return SEC_E_INSUFFICIENT_MEMORY;
+        return SEC_E_OK;
+    }
     X(SECPKG_ATTR_PASSWORD_EXPIRY);
     X(SECPKG_ATTR_STREAM_SIZES);
     X(SECPKG_ATTR_TARGET_INFORMATION);

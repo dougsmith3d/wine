@@ -723,7 +723,16 @@ static SECURITY_STATUS WINAPI lsa_QueryContextAttributesA(CtxtHandle *context, U
     X(SECPKG_ATTR_LIFESPAN);
     X(SECPKG_ATTR_NAMES);
     X(SECPKG_ATTR_NATIVE_NAMES);
-    X(SECPKG_ATTR_PACKAGE_INFO);
+    case SECPKG_ATTR_PACKAGE_INFO:
+    {
+        SecPkgContext_PackageInfoW infoW;
+        SecPkgContext_PackageInfoA *infoA = (SecPkgContext_PackageInfoA *)buffer;
+        SECURITY_STATUS status = lsa_QueryContextAttributesW( context, SECPKG_ATTR_PACKAGE_INFO, &infoW );
+        if (status != SEC_E_OK) return status;
+        if (!(infoA->PackageInfo = package_infoWtoA( infoW.PackageInfo ))) status = SEC_E_INSUFFICIENT_MEMORY;
+        FreeContextBuffer( infoW.PackageInfo );
+        return status;
+    }
     X(SECPKG_ATTR_PASSWORD_EXPIRY);
     X(SECPKG_ATTR_STREAM_SIZES);
     X(SECPKG_ATTR_TARGET_INFORMATION);
@@ -772,9 +781,17 @@ static SECURITY_STATUS WINAPI lsa_VerifySignature(CtxtHandle *context, SecBuffer
 
 static SECURITY_STATUS WINAPI lsa_QuerySecurityContextToken(CtxtHandle *context, HANDLE *token)
 {
-    FIXME("%p %p): stub\n", context, token);
-    if (!OpenProcessToken(GetCurrentProcess(), MAXIMUM_ALLOWED, token))
+    HANDLE proc_token;
+
+    TRACE("%p %p\n", context, token);
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE, &proc_token))
         return GetLastError();
+    if (!DuplicateTokenEx(proc_token, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenImpersonation, token))
+    {
+        CloseHandle(proc_token);
+        return GetLastError();
+    }
+    CloseHandle(proc_token);
     return SEC_E_OK;
 }
 

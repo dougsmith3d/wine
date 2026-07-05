@@ -78,4 +78,6 @@
 @ stdcall TranslateNameA(str long long ptr ptr)
 @ stdcall TranslateNameW(wstr long long ptr ptr)
 @ stdcall UnsealMessage(ptr ptr long ptr) DecryptMessage
+@ stdcall SeciAllocateAndSetIPAddress(ptr long ptr)
+@ stdcall SeciFreeCallContext(ptr)
 @ stdcall VerifySignature(ptr ptr long ptr)

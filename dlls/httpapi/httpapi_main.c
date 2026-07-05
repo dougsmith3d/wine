@@ -1050,6 +1050,33 @@ ULONG WINAPI HttpCloseRequestQueue(HANDLE handle)
 }
 
 /***********************************************************************
+ *        HttpCancelHttpRequest     (HTTPAPI.@)
+ */
+ULONG WINAPI HttpCancelHttpRequest(HANDLE queue, HTTP_REQUEST_ID id, OVERLAPPED *ovl)
+{
+    TRACE("queue %p, id %s, ovl %p.\n", queue, wine_dbgstr_longlong(id), ovl);
+
+    /* IIS calls this to abandon a pending async receive/send when a client
+     * disconnects or a request times out.  It maps onto cancelling the
+     * outstanding overlapped I/O on the request queue handle; leaving it as a
+     * @stub raises EXCEPTION_WINE_STUB and takes down the worker process. */
+    if (ovl)
+    {
+        if (!CancelIoEx(queue, ovl))
+            return GetLastError();
+    }
+    else if (!CancelIoEx(queue, NULL))
+    {
+        ULONG err = GetLastError();
+
+        /* Having nothing left to cancel is not a failure. */
+        if (err != ERROR_NOT_FOUND)
+            return err;
+    }
+    return ERROR_SUCCESS;
+}
+
+/***********************************************************************
  *        HttpSetRequestQueueProperty     (HTTPAPI.@)
  */
 ULONG WINAPI HttpSetRequestQueueProperty(HANDLE queue, HTTP_SERVER_PROPERTY property,

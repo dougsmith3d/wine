@@ -1,7 +1,7 @@
 @ stub HttpAddFragmentToCache
 @ stdcall HttpAddUrl(ptr wstr ptr)
 @ stdcall HttpAddUrlToUrlGroup(int64 wstr int64 long)
-@ stub HttpCancelHttpRequest
+@ stdcall HttpCancelHttpRequest(ptr int64 ptr)
 @ stdcall HttpCloseRequestQueue(ptr)
 @ stdcall HttpCloseServerSession(int64)
 @ stdcall HttpCloseUrlGroup(int64)

@@ -67,6 +67,8 @@ struct dynamic_unwind_entry
     DWORD             max_count;
     PGET_RUNTIME_FUNCTION_CALLBACK callback;
     PVOID             context;
+    LONG              active;   /* in-flight lookups still reading ->table; a delete must drain
+                                 * this to zero before the owner may free the table (rundown) */
 };
 
 static struct list dynamic_unwind_list = LIST_INIT(dynamic_unwind_list);
@@ -81,11 +83,13 @@ static RTL_CRITICAL_SECTION_DEBUG dynamic_unwind_debug =
 static RTL_CRITICAL_SECTION dynamic_unwind_section = { &dynamic_unwind_debug, -1, 0, 0, 0, 0 };
 
 
-static RUNTIME_FUNCTION *lookup_dynamic_function_table( ULONG_PTR pc, ULONG_PTR *base, ULONG *count )
+static RUNTIME_FUNCTION *lookup_dynamic_function_table( ULONG_PTR pc, ULONG_PTR *base, ULONG *count,
+                                                        struct dynamic_unwind_entry **pin )
 {
     struct dynamic_unwind_entry *entry;
     RUNTIME_FUNCTION *ret = NULL;
 
+    *pin = NULL;
     RtlEnterCriticalSection( &dynamic_unwind_section );
     LIST_FOR_EACH_ENTRY( entry, &dynamic_unwind_list, struct dynamic_unwind_entry, entry )
     {
@@ -96,17 +100,46 @@ static RUNTIME_FUNCTION *lookup_dynamic_function_table( ULONG_PTR pc, ULONG_PTR 
             {
                 ret = entry->callback( pc, entry->context );
                 *count = 1;
+                if (!ret)
+                    ERR( "PALATE-A callback NULL pc=%p base=%Ix end=%Ix cb=%p\n",
+                         (void *)pc, entry->base, entry->end, entry->callback );
             }
             else
             {
                 ret = entry->table;
                 *count = entry->count;
+                /* Pin the table for the caller's find_function_info() scan: while active is
+                 * non-zero a concurrent RtlDelete[Growable]FunctionTable will not return (and
+                 * hence the owner will not free the table) until we drop the reference. This
+                 * closes the Wine-only window where the scan reads a table the owner freed. */
+                entry->active++;
+                *pin = entry;
             }
             break;
         }
     }
     RtlLeaveCriticalSection( &dynamic_unwind_section );
     return ret;
+}
+
+
+static void release_dynamic_function_table( struct dynamic_unwind_entry *entry )
+{
+    InterlockedDecrement( &entry->active );
+}
+
+
+/* Remove a dynamic-table entry from the list, then wait for any in-flight lookup that is still
+ * reading its table to drain before the caller frees it (Windows rundown semantics). */
+static void drain_dynamic_function_table( struct dynamic_unwind_entry *entry )
+{
+    if (InterlockedCompareExchange( &entry->active, 0, 0 ))
+    {
+        ERR( "rundown: dynamic function table %p [%Ix-%Ix) freed while an unwind lookup is still "
+             "reading it (%ld active) -- use-after-free race caught\n",
+             entry->table, entry->base, entry->end, entry->active );
+        while (InterlockedCompareExchange( &entry->active, 0, 0 )) YieldProcessor();
+    }
 }
 
 
@@ -138,6 +171,7 @@ BOOLEAN CDECL RtlInstallFunctionTableCallback( ULONG_PTR table, ULONG_PTR base, 
     entry->max_count = 0;
     entry->callback  = callback;
     entry->context   = context;
+    entry->active    = 0;
 
     RtlEnterCriticalSection( &dynamic_unwind_section );
     list_add_tail( &dynamic_unwind_list, &entry->entry );
@@ -168,6 +202,7 @@ NTSTATUS WINAPI RtlAddGrowableFunctionTable( void **table, RUNTIME_FUNCTION *fun
     entry->max_count = max_count;
     entry->callback  = NULL;
     entry->context   = NULL;
+    entry->active    = 0;
 
     RtlEnterCriticalSection( &dynamic_unwind_section );
     list_add_tail( &dynamic_unwind_list, &entry->entry );
@@ -223,6 +258,7 @@ void WINAPI RtlDeleteGrowableFunctionTable( void *table )
     }
     RtlLeaveCriticalSection( &dynamic_unwind_section );
 
+    if (to_free) drain_dynamic_function_table( to_free );
     RtlFreeHeap( GetProcessHeap(), 0, to_free );
 }
 
@@ -250,6 +286,7 @@ BOOLEAN CDECL RtlDeleteFunctionTable( RUNTIME_FUNCTION *table )
 
     if (!to_free) return FALSE;
 
+    drain_dynamic_function_table( to_free );
     RtlFreeHeap( GetProcessHeap(), 0, to_free );
     return TRUE;
 }
@@ -918,14 +955,16 @@ PARM64_RUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *
     ARM64_RUNTIME_FUNCTION *func;
     ULONG_PTR dynbase;
     ULONG size;
+    struct dynamic_unwind_entry *pin;
 
     if ((func = (ARM64_RUNTIME_FUNCTION *)RtlLookupFunctionTable( pc, base, &size )))
         return find_function_info_arm64( pc, *base, func, size / sizeof(*func));
 
-    if ((func = (ARM64_RUNTIME_FUNCTION *)lookup_dynamic_function_table( pc, &dynbase, &size )))
+    if ((func = (ARM64_RUNTIME_FUNCTION *)lookup_dynamic_function_table( pc, &dynbase, &size, &pin )))
     {
         ARM64_RUNTIME_FUNCTION *ret = find_function_info_arm64( pc, dynbase, func, size );
         if (ret) *base = dynbase;
+        if (pin) release_dynamic_function_table( pin );
         return ret;
     }
 
@@ -1610,14 +1649,16 @@ PRUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *base,
     RUNTIME_FUNCTION *func;
     ULONG_PTR dynbase;
     ULONG size;
+    struct dynamic_unwind_entry *pin;
 
     if ((func = RtlLookupFunctionTable( pc, base, &size )))
         return find_function_info( pc, *base, func, size / sizeof(*func));
 
-    if ((func = lookup_dynamic_function_table( pc, &dynbase, &size )))
+    if ((func = lookup_dynamic_function_table( pc, &dynbase, &size, &pin )))
     {
         RUNTIME_FUNCTION *ret = find_function_info( pc, dynbase, func, size );
         if (ret) *base = dynbase;
+        if (pin) release_dynamic_function_table( pin );
         return ret;
     }
 
@@ -2297,32 +2338,113 @@ EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec, void *
 
 
 /**********************************************************************
+ *              raw_lookup_function_entry
+ *
+ * Uncached (pc -> ImageBase, RUNTIME_FUNCTION) resolution: static PE .pdata first,
+ * then the dynamic (JIT/callback) function tables.
+ */
+static RUNTIME_FUNCTION *raw_lookup_function_entry( ULONG_PTR pc, ULONG_PTR *base )
+{
+    RUNTIME_FUNCTION *func;
+    ULONG_PTR dynbase;
+    ULONG size;
+    struct dynamic_unwind_entry *pin;
+
+    if ((func = RtlLookupFunctionTable( pc, base, &size )))
+        return find_function_info( pc, *base, func, size / sizeof(*func));
+
+    if ((func = lookup_dynamic_function_table( pc, &dynbase, &size, &pin )))
+    {
+        RUNTIME_FUNCTION *ret = find_function_info( pc, dynbase, func, size );
+        if (!pin && !ret)
+            ERR( "PALATE-B callback RF rejected pc=%p dynbase=%Ix rf=%p begin=%x end=%x udata=%x\n",
+                 (void *)pc, dynbase, func, func->BeginAddress, func->EndAddress, func->UnwindData );
+        if (ret) *base = dynbase;
+        if (pin) release_dynamic_function_table( pin );
+        return ret;
+    }
+
+    *base = 0;
+    return NULL;
+}
+
+/* 0 = observe-only (still buggy, just LOG cross-pass divergences); 1 = apply the fix. */
+#define PALATE_HT_FIX 0
+
+/**********************************************************************
  *              RtlLookupFunctionEntry   (NTDLL.@)
+ *
+ * Windows caches every resolved (pc -> ImageBase, RUNTIME_FUNCTION) into the caller-supplied
+ * UNWIND_HISTORY_TABLE and returns the SAME pointer on a subsequent hit. The CLR's two-pass
+ * funclet EH depends on this: RtlDispatchException builds one history table for the SEARCH pass,
+ * and the CLR personality forwards that same table into RtlUnwindEx for the UNWIND pass, so every
+ * frame resolves to an identical snapshot across both passes even while another thread concurrently
+ * installs/removes/regrows a dynamic (JIT) function table. Wine ignored the table entirely, so under
+ * concurrent .NET JIT the unwind pass could resolve a frame's pc to a DIFFERENT RUNTIME_FUNCTION than
+ * the search pass did; the CLR then drove its unwind into a frame for which pass 1 recorded no catch,
+ * read a NULL catch-funclet PC from its ExceptionTracker and executed `call *0` (clr+0x1a38d8) -> an
+ * uncatchable AV -> iisexpress died. Only under load, only on Wine.
  */
 PRUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *base,
                                                  UNWIND_HISTORY_TABLE *table )
 {
     RUNTIME_FUNCTION *func;
-    ULONG_PTR dynbase;
-    ULONG size;
 
 #ifdef __arm64ec__
     if (RtlIsEcCode( pc ))
         return (RUNTIME_FUNCTION *)RtlLookupFunctionEntry_arm64( pc, base, table );
 #endif
 
-    if ((func = RtlLookupFunctionTable( pc, base, &size )))
-        return find_function_info( pc, *base, func, size / sizeof(*func));
-
-    if ((func = lookup_dynamic_function_table( pc, &dynbase, &size )))
+    if (table)
     {
-        RUNTIME_FUNCTION *ret = find_function_info( pc, dynbase, func, size );
-        if (ret) *base = dynbase;
-        return ret;
+        DWORD i;
+
+        for (i = 0; i < table->Count && i < UNWIND_HISTORY_TABLE_SIZE; i++)
+        {
+            func = table->Entry[i].FunctionEntry;
+            if (!func) continue;
+            if (pc <  table->Entry[i].ImageBase + func->BeginAddress) continue;
+            if (pc >= table->Entry[i].ImageBase + func->EndAddress) continue;
+
+            /* Cache hit. Re-resolve uncached and compare: a mismatch is precisely the cross-pass
+             * divergence that only Windows' history-table caching hides. This is the smoking gun. */
+            {
+                ULONG_PTR fresh_base = 0;
+                RUNTIME_FUNCTION *fresh = raw_lookup_function_entry( pc, &fresh_base );
+
+                if (!fresh || fresh_base != table->Entry[i].ImageBase ||
+                    fresh->BeginAddress != func->BeginAddress ||
+                    fresh->EndAddress   != func->EndAddress   ||
+                    fresh->UnwindData   != func->UnwindData)
+                {
+                    ERR( "PALATE-HT cross-pass divergence pc=%p cached{base=%Ix rf=%p b=%x e=%x u=%x} "
+                         "fresh{base=%Ix rf=%p b=%x e=%x u=%x}\n", (void *)pc,
+                         table->Entry[i].ImageBase, func, func->BeginAddress, func->EndAddress,
+                         func->UnwindData, fresh_base, fresh,
+                         fresh ? fresh->BeginAddress : 0, fresh ? fresh->EndAddress : 0,
+                         fresh ? fresh->UnwindData : 0 );
+                }
+#if PALATE_HT_FIX
+                *base = table->Entry[i].ImageBase;
+                return func;
+#else
+                /* observe-only: keep today's (buggy) behaviour so the crash still reproduces */
+                *base = fresh_base;
+                return fresh;
+#endif
+            }
+        }
     }
 
-    *base = 0;
-    return NULL;
+    func = raw_lookup_function_entry( pc, base );
+
+    if (func && table && table->Count < UNWIND_HISTORY_TABLE_SIZE)
+    {
+        table->Entry[table->Count].ImageBase     = *base;
+        table->Entry[table->Count].FunctionEntry = func;
+        table->Count++;
+    }
+    return func;
 }
 
 

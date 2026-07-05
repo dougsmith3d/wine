@@ -245,6 +245,13 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     context = *orig_context;
     context.ContextFlags &= ~0x40; /* Clear xstate flag. */
 
+    /* Windows' RtlDispatchException hands the language/personality routine a zero-initialised,
+     * OS-maintained UNWIND_HISTORY_TABLE. Wine historically left this on-stack table uninitialised
+     * (it is only ever passed through, never read by Wine's own unwinder), so the .NET CLR
+     * personality (ProcessCLRException), which DOES consult the history table it receives via the
+     * DISPATCHER_CONTEXT, saw stack garbage. Zero it to match Windows. */
+    memset( &table, 0, sizeof(table) );
+
     dispatch.TargetIp      = 0;
     dispatch.ContextRecord = &context;
     dispatch.HistoryTable  = &table;

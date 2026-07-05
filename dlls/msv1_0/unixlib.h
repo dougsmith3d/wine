@@ -89,6 +89,7 @@ struct ntlm_ctx
             struct arc4_info recv_arc4info;
         } ntlm2;
     } crypt;
+    char username[256];
 };
 
 

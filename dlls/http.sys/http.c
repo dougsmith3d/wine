@@ -1040,7 +1040,11 @@ static NTSTATUS http_send_response(struct request_queue *queue, IRP *irp)
         if (send(conn->socket, response->buffer, response->len, 0) >= 0)
         {
             /* Clean up the connection if we are not sending more response data. */
-            if (response->response_flags != HTTP_SEND_RESPONSE_FLAG_MORE_DATA)
+            /* Finalize only when MORE_DATA is not set. Callers (e.g. IIS dynamic
+             * compression) OR in BUFFER_DATA (0x4) with MORE_DATA (0x2); an exact
+             * equality check wrongly finalized on 0x6, dropping the terminating
+             * chunked-transfer 0-length chunk and hanging HTTP/1.1 clients. */
+            if (!(response->response_flags & HTTP_SEND_RESPONSE_FLAG_MORE_DATA))
             {
                 if (conn->content_len)
                 {

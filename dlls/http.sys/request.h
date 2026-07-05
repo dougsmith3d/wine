@@ -101,7 +101,7 @@ static NTSTATUS complete_irp(struct connection *conn, IRP *irp)
 {
     const struct http_receive_request_params params
             = *(struct http_receive_request_params *)irp->AssociatedIrp.SystemBuffer;
-    ULONG cooked_len, host_len, abs_path_len, query_len, chunk_len = 0, offset, processed;
+    ULONG cooked_len, cooked_abs_len = 0, host_len, abs_path_len, query_len, chunk_len = 0, offset, processed;
     IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
     const DWORD output_len = stack->Parameters.DeviceIoControl.OutputBufferLength;
     struct http_request *req = irp->AssociatedIrp.SystemBuffer;
@@ -143,7 +143,18 @@ static NTSTATUS complete_irp(struct connection *conn, IRP *irp)
     }
     else
         query_len = 0;
-    cooked_len = (7 /* scheme */ + host_len + abs_path_len + query_len) * sizeof(WCHAR);
+    {
+        /* The cooked abs path is percent-decoded below, so size it decoded. */
+        ULONG _i;
+        for (_i = 0; _i < abs_path_len; _i++)
+        {
+            if (abs_path[_i] == '%' && _i + 2 < abs_path_len
+                    && isxdigit((unsigned char)abs_path[_i + 1]) && isxdigit((unsigned char)abs_path[_i + 2]))
+                _i += 2;
+            cooked_abs_len++;
+        }
+    }
+    cooked_len = (7 /* scheme */ + host_len + cooked_abs_len + query_len) * sizeof(WCHAR);
     irp_size += cooked_len + sizeof(WCHAR);
 
     /* addresses */
@@ -202,23 +213,42 @@ static NTSTATUS complete_irp(struct connection *conn, IRP *irp)
     offset += conn->url_len;
     buffer[offset++] = 0;
 
-    req->CookedUrl.FullUrlLength = cooked_len;
     req->CookedUrl.HostLength = host_len * sizeof(WCHAR);
-    req->CookedUrl.AbsPathLength = abs_path_len * sizeof(WCHAR);
     req->CookedUrl.QueryStringLength = query_len * sizeof(WCHAR);
     req->CookedUrl.pFullUrl = params.addr + offset;
     req->CookedUrl.pHost = req->CookedUrl.pFullUrl + 7 * sizeof(WCHAR);
     req->CookedUrl.pAbsPath = req->CookedUrl.pHost + host_len * sizeof(WCHAR);
-    if (query)
-        req->CookedUrl.pQueryString = req->CookedUrl.pAbsPath + abs_path_len * sizeof(WCHAR);
 
     memcpy(buffer + offset, L"http://", sizeof(L"http://"));
     offset += 7 * sizeof(WCHAR);
     MultiByteToWideChar(CP_ACP, 0, host, host_len, (WCHAR *)(buffer + offset), host_len * sizeof(WCHAR));
     offset += host_len * sizeof(WCHAR);
-    MultiByteToWideChar(CP_ACP, 0, abs_path, abs_path_len + query_len,
-            (WCHAR *)(buffer + offset), (abs_path_len + query_len) * sizeof(WCHAR));
-    offset += (abs_path_len + query_len) * sizeof(WCHAR);
+    {
+        WCHAR *ap = (WCHAR *)(buffer + offset);
+        int di = 0, i;
+        for (i = 0; i < (int)abs_path_len; i++)
+        {
+            if (abs_path[i] == '%' && i + 2 < (int)abs_path_len
+                    && isxdigit((unsigned char)abs_path[i + 1]) && isxdigit((unsigned char)abs_path[i + 2]))
+            {
+                int hi = (unsigned char)abs_path[i + 1], lo = (unsigned char)abs_path[i + 2];
+                hi = hi <= '9' ? hi - '0' : (tolower(hi) - 'a' + 10);
+                lo = lo <= '9' ? lo - '0' : (tolower(lo) - 'a' + 10);
+                ap[di++] = (WCHAR)((hi << 4) | lo);
+                i += 2;
+            }
+            else ap[di++] = (unsigned char)abs_path[i];
+        }
+        req->CookedUrl.AbsPathLength = di * sizeof(WCHAR);
+        offset += di * sizeof(WCHAR);
+        if (query)
+        {
+            req->CookedUrl.pQueryString = params.addr + offset;
+            MultiByteToWideChar(CP_ACP, 0, query, query_len, (WCHAR *)(buffer + offset), query_len * sizeof(WCHAR));
+            offset += query_len * sizeof(WCHAR);
+        }
+        req->CookedUrl.FullUrlLength = (7 + host_len + di + query_len) * sizeof(WCHAR);
+    }
     buffer[offset++] = 0;
     buffer[offset++] = 0;
 
