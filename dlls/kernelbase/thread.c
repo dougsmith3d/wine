@@ -441,12 +441,45 @@ DWORD WINAPI DECLSPEC_HOTPATCH QueueUserAPC2( PAPCFUNC func, HANDLE thread, ULON
 /***********************************************************************
  *           QueryThreadCycleTime   (kernelbase.@)
  */
+/* Wine has no per-thread hardware cycle counter, so approximate the accumulated
+ * cycle count from the thread's consumed CPU time (100ns units, from ThreadTimes)
+ * scaled by the host TSC frequency measured once against the performance counter.
+ * The result is a real, monotonic measure of the thread's CPU consumption. */
+static ULONG64 cycles_per_100ns( void )
+{
+    static ULONG64 cached;
+    LARGE_INTEGER freq, c0, c1;
+    ULONG64 t0, t1, elapsed;
+    double tsc_hz;
+
+    if (cached) return cached;
+    if (NtQueryPerformanceCounter( &c0, &freq ) || !freq.QuadPart) return (cached = 1);
+    t0 = __builtin_ia32_rdtsc();
+    do { NtQueryPerformanceCounter( &c1, NULL ); }
+    while ((ULONG64)(c1.QuadPart - c0.QuadPart) < (ULONG64)freq.QuadPart / 1000); /* ~1ms */
+    t1 = __builtin_ia32_rdtsc();
+    elapsed = c1.QuadPart - c0.QuadPart;
+    if (!elapsed || t1 <= t0) return (cached = 1);
+    tsc_hz = (double)(t1 - t0) * (double)freq.QuadPart / (double)elapsed;
+    cached = (ULONG64)(tsc_hz / 10000000.0); /* cycles per 100ns unit */
+    if (!cached) cached = 1;
+    return cached;
+}
+
 BOOL WINAPI DECLSPEC_HOTPATCH QueryThreadCycleTime( HANDLE thread, ULONG64 *cycle )
 {
-    static int once;
-    if (!once++) FIXME( "(%p,%p): stub!\n", thread, cycle );
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    KERNEL_USER_TIMES times;
+    NTSTATUS status;
+
+    if (!cycle)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    status = NtQueryInformationThread( thread, ThreadTimes, &times, sizeof(times), NULL );
+    if (!set_ntstatus( status )) return FALSE;
+    *cycle = (ULONG64)(times.KernelTime.QuadPart + times.UserTime.QuadPart) * cycles_per_100ns();
+    return TRUE;
 }
 
 
