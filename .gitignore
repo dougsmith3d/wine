@@ -1,0 +1,24 @@
+# Backup/snapshot copies an agent leaves behind before editing a Wine source file (a defensive
+# "save the original before I touch it" copy, e.g. "bcrypt_main.c.pre_capiexport",
+# "cert.c.bak.wbsdiag", "device.c.orig", "protectdata.c.pristine", "loader.c.v12") are working
+# notes, never part of the actual patch. Committed alongside real fixes, they've repeatedly
+# polluted the dashboard's Patches tab: one commit's real ~2-file fix showed as +120,828 lines
+# across 67 files because 60+ of these snapshot copies rode along in the same commit. Keep them
+# out of git entirely so this can't recur -- see /root/wbs/sim/state.py's _is_artifact_path() /
+# _ARTIFACT_SEGMENT_RE for the dashboard-side filter this list is meant to make unnecessary
+# going forward (that filter stays too, for the already-committed history it can't rewrite).
+#
+# Patterns are broad substring matches (verified against the full tracked tree with zero
+# collisions against real Wine filenames -- no legitimate source file has ".pre"/".bak"/".clean"/
+# ".orig" as a substring of its name).
+*.clean*
+*.bak*
+*.pre*
+*.orig*
+*.winorig
+*.etwbak
+*.pristine
+*.baseline*
+*.v[0-9]*
+*.rej
+*~
