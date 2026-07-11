@@ -192,6 +192,7 @@ static LDR_DDAG_NODE *node_ntdll, *node_kernel32;
 
 static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD flags, WINE_MODREF** pwm, BOOL system );
 static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved );
+static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path );
 static FARPROC find_ordinal_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports,
                                     DWORD exp_size, DWORD ordinal, LPCWSTR load_path,
                                     WINE_MODREF *importer, BOOL is_dynamic );
@@ -978,7 +979,25 @@ static FARPROC find_forwarded_export( HMODULE module, const char *forward, LPCWS
         /* Prepare for the callee stealing the reference */
         if (!wm_loaded && wm->ldr.LoadCount != -1) wm->ldr.LoadCount++;
         add_module_dependency( importer->ldr.DdagNode, wm->ldr.DdagNode );
-        if (is_dynamic && wm_loaded && process_attach( wm->ldr.DdagNode, NULL ) != STATUS_SUCCESS)
+
+        /* The forwarded-to module may have been mapped earlier with
+         * DONT_RESOLVE_DLL_REFERENCES (e.g. loaded only to read version info or
+         * resources), leaving its imports unsnapped and LDR_DONT_RESOLVE_REFS set.
+         * Handing out an executable address into such a module would call through
+         * an unresolved import thunk and crash. Resolve its references now, as
+         * Windows does when the module is actually used through a forwarder. */
+        if (wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)
+        {
+            if (fixup_imports( wm, load_path ) != STATUS_SUCCESS)
+            {
+                ERR( "failed to resolve imports for forward '%s' used by %s\n",
+                     forward, debugstr_w(get_modref( module )->ldr.FullDllName.Buffer) );
+                if (wm_loaded) LdrUnloadDll( wm->ldr.DllBase );
+                return NULL;
+            }
+            process_attach( wm->ldr.DdagNode, NULL );
+        }
+        else if (is_dynamic && wm_loaded && process_attach( wm->ldr.DdagNode, NULL ) != STATUS_SUCCESS)
         {
             ERR( "process_attach failed for forward '%s' used by %s\n",
                  forward, debugstr_w(get_modref( module )->ldr.FullDllName.Buffer) );
@@ -1474,6 +1493,26 @@ static NTSTATUS fixup_imports_ilonly( WINE_MODREF *wm, LPCWSTR load_path, void *
 
 
 /****************************************************************
+ *       import_target_in_progress
+ *
+ * Return whether the dependency named by an import descriptor is itself still
+ * being snapped (a circular-import edge).  Used to break the snapping recursion
+ * on a re-entrant fixup_imports without loading anything.
+ * The loader_section must be locked while calling this function.
+ */
+static BOOL import_target_in_progress( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr )
+{
+    WCHAR buffer[256];
+    WINE_MODREF *imp;
+    const char *name = get_rva( wm->ldr.DllBase, descr->Name );
+
+    if (build_import_name( wm, buffer, name, strlen(name) )) return FALSE;
+    if (!(imp = find_basename_module( buffer ))) return FALSE;
+    return (imp->ldr.Flags & LDR_LOAD_IN_PROGRESS) != 0;
+}
+
+
+/*************************************************************************
  *       fixup_imports
  *
  * Fixup all imports of a given module.
@@ -1487,23 +1526,61 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
     int i, nb_imports;
     DWORD size;
     NTSTATUS status;
-    ULONG_PTR cookie;
+    ULONG_PTR cookie = 0;
+    BOOL reentrant;
 
     if (!(wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)) return STATUS_SUCCESS;  /* already done */
-    wm->ldr.Flags &= ~LDR_DONT_RESOLVE_REFS;
 
-    if (alloc_tls_slot( &wm->ldr )) wm->ldr.TlsIndex = -1;
+    /* Do NOT clear LDR_DONT_RESOLVE_REFS until every thunk below is actually
+     * snapped.  That flag is what the export-lookup paths (find_forwarded_export)
+     * test to know a module still has raw import thunks that must be resolved
+     * before its address is handed out.  Clearing it here, before the loop,
+     * exposes the module as "resolved" while its imports are still unbound.
+     * With a circular import (combase <-> ole32, where combase snaps rpcrt4
+     * only *after* ole32) a caller reached through the cycle then gets an
+     * export, e.g. combase!CoCreateGuid, whose own import thunk
+     * (rpcrt4!UuidCreate) is still the unbound import-by-name RVA; executing it
+     * jumps to that bogus low address and faults.  Keep the flag set as an
+     * accurate "not yet snapped" marker and use LDR_LOAD_IN_PROGRESS purely to
+     * break the snapping recursion; mark the module resolved only at the end.
+     *
+     * Re-entrancy (the LDR_LOAD_IN_PROGRESS case) must NOT be a blanket no-op:
+     * that is what left combase!CoCreateGuid's rpcrt4!UuidCreate thunk unbound.
+     * combase's import table lists ole32 *before* rpcrt4, so when combase's
+     * outer fixup is suspended on the ole32 edge and the cycle re-enters here
+     * through ole32, returning early leaves UuidCreate raw while combase's
+     * address is handed to ole32 / the CoCreateGuid forwarder.  A later call
+     * (e.g. a SharePoint perfmon timer thread's Guid.NewGuid) then jumps
+     * through the unbound thunk to the import-by-name RVA and faults on execute.
+     * So on a re-entrant call still snap every dependency that is not itself a
+     * live cycle edge: that binds this module's remaining thunks (rpcrt4 has no
+     * cycle back, so UuidCreate gets bound now) before the address escapes.
+     * Only the still-in-progress cyclic edges are skipped, which keeps the
+     * recursion finite.  The suspended outer loop re-runs all descriptors; the
+     * thunk writes are idempotent, so the extra pass is harmless.  Leave the
+     * flags to the outer frame - only it may mark the module fully resolved. */
+    reentrant = (wm->ldr.Flags & LDR_LOAD_IN_PROGRESS) != 0;
+    wm->ldr.Flags |= LDR_LOAD_IN_PROGRESS;
+
+    if (!reentrant && alloc_tls_slot( &wm->ldr )) wm->ldr.TlsIndex = -1;
 
     if (!(imports = RtlImageDirectoryEntryToData( wm->ldr.DllBase, TRUE,
                                                   IMAGE_DIRECTORY_ENTRY_IMPORT, &size )))
+    {
+        if (!reentrant) wm->ldr.Flags &= ~(LDR_DONT_RESOLVE_REFS | LDR_LOAD_IN_PROGRESS);
         return STATUS_SUCCESS;
+    }
 
     nb_imports = 0;
     while (imports[nb_imports].Name && imports[nb_imports].FirstThunk) nb_imports++;
 
-    if (!nb_imports) return STATUS_SUCCESS;  /* no imports */
+    if (!nb_imports)  /* no imports */
+    {
+        if (!reentrant) wm->ldr.Flags &= ~(LDR_DONT_RESOLVE_REFS | LDR_LOAD_IN_PROGRESS);
+        return STATUS_SUCCESS;
+    }
 
-    if (!create_module_activation_context( &wm->ldr ))
+    if (!reentrant && !create_module_activation_context( &wm->ldr ))
         RtlActivateActivationContext( 0, wm->ldr.ActivationContext, &cookie );
 
     /* load the imported modules. They are automatically
@@ -1512,13 +1589,25 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
     status = STATUS_SUCCESS;
     for (i = 0; i < nb_imports; i++)
     {
+        /* On a re-entrant (cyclic) fixup, skip a dependency that is itself
+         * still being snapped - loading it would recurse forever - but snap
+         * everything else now so this module's own thunks get bound before its
+         * address is handed out through the cycle. */
+        if (reentrant && import_target_in_progress( wm, &imports[i] )) continue;
         dep_after = wm->ldr.DdagNode->Dependencies.Tail;
         if (!import_dll( wm, &imports[i], load_path, &imp ))
             status = STATUS_DLL_NOT_FOUND;
-        else if (imp && imp->ldr.DdagNode != node_ntdll && imp->ldr.DdagNode != node_kernel32)
+        /* The suspended outer frame owns the dependency-graph edges; a
+         * re-entrant pass only binds thunks, so it must not add them again. */
+        else if (!reentrant && imp && imp->ldr.DdagNode != node_ntdll && imp->ldr.DdagNode != node_kernel32)
             add_module_dependency_after( wm->ldr.DdagNode, imp->ldr.DdagNode, dep_after );
     }
-    if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
+    if (!reentrant)
+    {
+        if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
+        /* every thunk is now bound: only now is the module safe to hand out */
+        wm->ldr.Flags &= ~(LDR_DONT_RESOLVE_REFS | LDR_LOAD_IN_PROGRESS);
+    }
     return status;
 }
 
@@ -3596,6 +3685,18 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     if (*pwm)  /* found already loaded module */
     {
         if ((*pwm)->ldr.LoadCount != -1) (*pwm)->ldr.LoadCount++;
+
+        /* A module first mapped with DONT_RESOLVE_DLL_REFERENCES (e.g. loaded
+         * only to read resources or version info) still has raw, unsnapped
+         * import thunks.  If it is now being pulled in for real, snap them
+         * before handing the module back - just as Windows does when a plain
+         * LoadLibrary follows a resource-only load - otherwise a caller can
+         * execute an export that jumps through an unbound thunk (the SharePoint
+         * combase!CoCreateGuid -> rpcrt4!UuidCreate crash). */
+        if (!(flags & DONT_RESOLVE_DLL_REFERENCES) &&
+            ((*pwm)->ldr.Flags & LDR_DONT_RESOLVE_REFS) &&
+            !((*pwm)->ldr.Flags & LDR_COR_ILONLY))
+            fixup_imports( *pwm, load_path );
 
         TRACE("Found %s for %s at %p, count=%d\n",
               debugstr_w((*pwm)->ldr.FullDllName.Buffer), debugstr_w(libname),
