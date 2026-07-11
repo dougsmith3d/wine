@@ -97,27 +97,44 @@ static PEB64 *get_peb64( void )
     return (PEB64 *)(UINT_PTR)teb64->Peb;
 }
 
+/* Map the locale index table and record the system LCID.  This is the part of
+ * locale_init() that has no dependency on the activation context, so it can run
+ * at any time - including before the full locale_init().  Some callers query
+ * locale names very early (e.g. activation-context processing during process
+ * init, before locale_init() runs at LdrInitializeThunk).  On Windows the NLS
+ * tables are always mapped, so those lookups succeed; under Wine locale_table
+ * was still NULL and the lookup helpers dereferenced it, taking a hardware
+ * access violation.  In a managed host that AV becomes an uncatchable
+ * Corrupted-State AccessViolationException (0xe0434352) that kills the whole
+ * process.  Make the table available on demand so the lookups never fault.
+ * Idempotent and safe to race: concurrent callers store the same pointers. */
+static void ensure_locale_table(void)
+{
+    const struct locale_nls_header *header;
+    LARGE_INTEGER unused;
+
+    if (locale_table) return;
+    if (RtlGetLocaleFileMappingAddress( (void **)&header, &system_lcid, &unused )) return;
+    locale_table = (const NLS_LOCALE_HEADER *)((char *)header + header->locales);
+    locale_strings = (const WCHAR *)((char *)locale_table + locale_table->strings_offset);
+}
+
 void locale_init(void)
 {
     const NLS_LOCALE_LCID_INDEX *entry;
     USHORT utf8[2] = { 0, CP_UTF8 };
     WCHAR locale[LOCALE_NAME_MAX_LENGTH];
-    LARGE_INTEGER unused;
     SIZE_T size;
     UINT ansi_cp = 1252, oem_cp = 437;
     void *ansi_ptr = utf8, *oem_ptr = utf8, *case_ptr;
-    NTSTATUS status;
-    const struct locale_nls_header *header;
     PEB64 *peb64 = get_peb64();
 
-    status = RtlGetLocaleFileMappingAddress( (void **)&header, &system_lcid, &unused );
-    if (status)
+    ensure_locale_table();
+    if (!locale_table)
     {
-        ERR( "locale init failed %lx\n", status );
+        ERR( "locale init failed: NLS locale table not available\n" );
         return;
     }
-    locale_table = (const NLS_LOCALE_HEADER *)((char *)header + header->locales);
-    locale_strings = (const WCHAR *)((char *)locale_table + locale_table->strings_offset);
 
     entry = find_lcid_entry( locale_table, system_lcid );
     ansi_cp = get_locale_data( locale_table, entry->idx )->idefaultansicodepage;
@@ -866,7 +883,10 @@ WCHAR __cdecl towupper( WCHAR ch )
  */
 BOOLEAN WINAPI RtlIsValidLocaleName( const WCHAR *name, ULONG flags )
 {
-    const NLS_LOCALE_LCNAME_INDEX *entry = find_lcname_entry( locale_table, name );
+    const NLS_LOCALE_LCNAME_INDEX *entry;
+
+    ensure_locale_table();
+    entry = find_lcname_entry( locale_table, name );
 
     if (!entry) return FALSE;
     /* reject neutral locale unless flag 2 is set */
@@ -885,6 +905,8 @@ NTSTATUS WINAPI RtlLcidToLocaleName( LCID lcid, UNICODE_STRING *str, ULONG flags
     ULONG len;
 
     if (!str) return STATUS_INVALID_PARAMETER_2;
+
+    ensure_locale_table();
 
     switch (lcid)
     {
@@ -929,7 +951,10 @@ NTSTATUS WINAPI RtlLcidToLocaleName( LCID lcid, UNICODE_STRING *str, ULONG flags
  */
 NTSTATUS WINAPI RtlLocaleNameToLcid( const WCHAR *name, LCID *lcid, ULONG flags )
 {
-    const NLS_LOCALE_LCNAME_INDEX *entry = find_lcname_entry( locale_table, name );
+    const NLS_LOCALE_LCNAME_INDEX *entry;
+
+    ensure_locale_table();
+    entry = find_lcname_entry( locale_table, name );
 
     if (!entry) return STATUS_INVALID_PARAMETER_1;
     /* reject neutral locale unless flag 2 is set */
