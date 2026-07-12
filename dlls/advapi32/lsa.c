@@ -417,11 +417,28 @@ static BOOL lookup_synthesized_local_name( const LSA_UNICODE_STRING *name, SID *
     for (i = 0; i < acctlen; i++) if (name->Buffer[i] == '\\') { domlen = i; break; }
     if (domlen)
     {
-        /* Synthesize for ANY prefixed name (e.g. "NT Service\SPTimerV4"), not only
-           <computername>\account -- .NET NTAccount.Translate of a service/virtual account in an
-           IPC-channel ACL goes through LsaLookupNames2 and must not NONE_MAPPED (else
-           IdentityNotMappedException). Hash the FULL "domain\account" so it stays deterministic
-           and unique; well-known names are already handled before this synthesis is reached. */
+        /* Synthesize only for a local pseudo-domain: the "NT Service" virtual-account
+           domain (e.g. "NT Service\SPTimerV4") or this computer's own name. .NET
+           NTAccount.Translate of such an account in an IPC-channel ACL goes through
+           LsaLookupNames2 and must not NONE_MAPPED (else IdentityNotMappedException).
+           A name qualified with any OTHER domain is a foreign / directory account
+           (e.g. an AD forest user such as SIGNALLAB\alice): on Windows LsaLookupNames2
+           leaves it unmapped, which lets SharePoint's people picker fall through to its
+           configured AD forest LDAP search. Claiming it here with a bogus local
+           S-1-5-21-0-0-0-* SID suppresses that fallback, so decline it instead
+           (mirrors lookup_local_synthesized_name in security.c). */
+        static const WCHAR nt_service[] = {'N','T',' ','S','E','R','V','I','C','E',0};
+        BOOL local_dom = FALSE;
+
+        if (domlen == ARRAY_SIZE(nt_service) - 1 && !wcsnicmp( name->Buffer, nt_service, domlen ))
+            local_dom = TRUE;
+        else if (complen && domlen == complen && !wcsnicmp( name->Buffer, computer, domlen ))
+            local_dom = TRUE;
+
+        if (!local_dom) return FALSE;
+
+        /* Hash the FULL "domain\account" so it stays deterministic and unique;
+           well-known names are already handled before this synthesis is reached. */
         acct = name->Buffer + domlen + 1;
         acctlen = acctlen - domlen - 1;
         if (!acctlen) return FALSE;
@@ -475,8 +492,6 @@ static BOOL lookup_name( LSA_UNICODE_STRING *name, SID *sid, DWORD *sid_size, WC
         ret = lookup_local_user_name( name, sid, sid_size, domain, domain_size, use, handled );
     if (!*handled)
         ret = lookup_synthesized_local_name( name, sid, sid_size, domain, domain_size, use, handled );
-    if (!*handled)
-        MESSAGE( "wine_lsa_dbg: lookup_name UNMAPPED name=%s\n", debugstr_wn(name->Buffer, name->Length/sizeof(WCHAR)) );
 
     return ret;
 }

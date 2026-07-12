@@ -1418,8 +1418,38 @@ static BOOL lookup_local_synthesized_name( const LSA_UNICODE_STRING *account, PS
     WCHAR domainName[MAX_COMPUTERNAME_LENGTH + 1];
     BOOL ret = TRUE, is_service = FALSE;
     PSID pSid = NULL;
+    LSA_UNICODE_STRING acct, dom;
 
     *handled = TRUE;
+
+    /* Only synthesize a SID for un-qualified names (local WSS_WPG / WSS_ADMIN_WPG
+     * groups) or names carrying a local pseudo-domain (this computer, or the
+     * "NT SERVICE" virtual-account domain). A name qualified with any other
+     * domain is a foreign / directory account (e.g. an AD forest user such as
+     * SIGNALLAB\\alice): on Windows LookupAccountNameW returns ERROR_NONE_MAPPED
+     * for it, which lets the caller fall through to its configured directory
+     * search. Claiming it here and returning a bogus local S-1-5-21-* SID would
+     * suppress that fallback, so decline the name instead. */
+    split_domain_account( account, &acct, &dom );
+    if (dom.Buffer && dom.Length)
+    {
+        static const WCHAR nt_service[] = {'N','T',' ','S','E','R','V','I','C','E',0};
+        WCHAR local[MAX_COMPUTERNAME_LENGTH + 1];
+        DWORD local_len = ARRAY_SIZE(local), dlen = dom.Length / sizeof(WCHAR);
+        BOOL local_dom = FALSE;
+
+        if (dlen == ARRAY_SIZE(nt_service) - 1 && !wcsnicmp( dom.Buffer, nt_service, dlen ))
+            local_dom = TRUE;
+        else if (GetComputerNameW( local, &local_len ) && dlen == local_len &&
+                 !wcsnicmp( dom.Buffer, local, dlen ))
+            local_dom = TRUE;
+
+        if (!local_dom)
+        {
+            *handled = FALSE;
+            return FALSE;
+        }
+    }
     for (i = 0; i < n; i++) { WCHAR c = p[i]; if (c >= 'a' && c <= 'z') c -= 32; rid = rid * 131 + c; }
     rid = (rid & 0x3fffffff) | 0x1000;
 
@@ -1435,8 +1465,6 @@ static BOOL lookup_local_synthesized_name( const LSA_UNICODE_STRING *account, PS
     else
         RtlAllocateAndInitializeSid( &nt, 5, 21, 0x53504e54, 0x57494e45, rid, 0, 0, 0, 0, &pSid );
     if (!pSid) { *handled = FALSE; return FALSE; }
-
-    MESSAGE( "wine_lan_dbg: synthesized local SID for %s (rid=%#lx svc=%d)\n", debugstr_w(account->Buffer), rid, is_service );
 
     len = GetLengthSid( pSid );
     if (Sid && *cbSid >= len) CopySid( *cbSid, Sid, pSid );
@@ -1495,7 +1523,6 @@ BOOL WINAPI LookupAccountNameW( LPCWSTR lpSystemName, LPCWSTR lpAccountName, PSI
     if (handled)
         return ret;
 
-    MESSAGE( "wine_lan_dbg: LookupAccountNameW NONE_MAPPED for %s\n", debugstr_w(lpAccountName) );
     SetLastError( ERROR_NONE_MAPPED );
     return FALSE;
 }
