@@ -1505,12 +1505,48 @@ static HRESULT WINAPI search_SetSearchPreference(IDirectorySearch *iface, PADS_S
     return hr;
 }
 
+/* A serverless/domain bind ("LDAP://<host>" with no distinguished name) resolves, on Windows
+ * ADSI, to the domain's default naming context read from rootDSE. Without it the search base is
+ * empty and a subtree search fails with LDAP_NO_SUCH_OBJECT, so mirror ADSI and look it up. */
+static BSTR query_default_naming_context(LDAP *ld)
+{
+    WCHAR *attrs[] = { (WCHAR *)L"defaultNamingContext", NULL };
+    LDAPMessage *res = NULL, *entry;
+    WCHAR **values;
+    BSTR dn = NULL;
+    ULONG err;
+
+    err = ldap_search_ext_sW(ld, NULL, LDAP_SCOPE_BASE, (WCHAR *)L"(objectClass=*)", attrs,
+                             FALSE, NULL, NULL, NULL, 0, &res);
+    if (err != LDAP_SUCCESS)
+    {
+        TRACE("rootDSE search error %#lx\n", err);
+        return NULL;
+    }
+
+    entry = ldap_first_entry(ld, res);
+    if (entry)
+    {
+        values = ldap_get_valuesW(ld, entry, (WCHAR *)L"defaultNamingContext");
+        if (values && values[0])
+            dn = SysAllocString(values[0]);
+        ldap_value_freeW(values);
+    }
+
+    ldap_msgfree(res);
+    TRACE("defaultNamingContext %s\n", debugstr_w(dn));
+    return dn;
+}
+
 static HRESULT WINAPI search_ExecuteSearch(IDirectorySearch *iface, LPWSTR filter, LPWSTR *names,
                                            DWORD count, PADS_SEARCH_HANDLE res)
 {
     LDAP_namespace *ldap = impl_from_IDirectorySearch(iface);
     ULONG err, i;
     WCHAR **props, *object;
+    BSTR base_dn = NULL;
+    ULONG saved_referrals = 0;
+    BOOL restore_referrals = FALSE;
     LDAPControlW **ctrls = NULL, *ctrls_a[2], tombstone;
     struct ldap_search_context *ldap_ctx;
 
@@ -1561,6 +1597,25 @@ static HRESULT WINAPI search_ExecuteSearch(IDirectorySearch *iface, LPWSTR filte
     object = ldap->object;
     if (object && !wcsicmp(object, L"rootDSE"))
         object = NULL;
+    else if (!object && ldap->search.scope != ADS_SCOPE_BASE)
+    {
+        /* A no-DN domain bind ("LDAP://<host>") resolves, on Windows ADSI, to the domain's
+         * default naming context read from rootDSE; use it as the search base. This only matters
+         * for onelevel/subtree searches -- an ADS_SCOPE_BASE bind reads rootDSE itself and needs
+         * no base. A subtree search rooted at the default naming context also returns continuation
+         * references to the forest's sibling naming contexts (Configuration, *DnsZones); OpenLDAP
+         * chases them and fails the whole search with LDAP_OPERATIONS_ERROR, whereas Windows ADSI
+         * (ADS_CHASE_REFERRALS_EXTERNAL) does not chase these subordinate referrals. Suppress
+         * chasing for this one search only, saving and restoring the option so the shared
+         * per-namespace connection keeps its referral behaviour for later searches. */
+        object = base_dn = query_default_naming_context(ldap->ld);
+        if (base_dn)
+        {
+            if (ldap_get_optionW(ldap->ld, LDAP_OPT_REFERRALS, &saved_referrals) == LDAP_SUCCESS)
+                restore_referrals = TRUE;
+            ldap_set_optionW(ldap->ld, LDAP_OPT_REFERRALS, LDAP_OPT_OFF);
+        }
+    }
 
     if (ldap->search.pagesize)
     {
@@ -1578,6 +1633,10 @@ static HRESULT WINAPI search_ExecuteSearch(IDirectorySearch *iface, LPWSTR filte
                                  ldap->search.attribtypes_only, ctrls, NULL, NULL, ldap->search.size_limit,
                                  &ldap_ctx->res);
     free(props);
+    if (restore_referrals)
+        ldap_set_optionW(ldap->ld, LDAP_OPT_REFERRALS,
+                         saved_referrals ? LDAP_OPT_ON : LDAP_OPT_OFF);
+    SysFreeString(base_dn);
     if (err != LDAP_SUCCESS)
     {
         TRACE("ldap_search_sW error %#lx\n", err);
