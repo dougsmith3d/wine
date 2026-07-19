@@ -203,6 +203,12 @@ static LDAP *create_context( const char *url )
     if (map_error( ldap_initialize( &CTX(ld), url ) ) == WLDAP32_LDAP_SUCCESS)
     {
         ldap_set_option( CTX(ld), LDAP_OPT_PROTOCOL_VERSION, &version );
+        /* Windows wldap32 defaults to LDAP_CHASE_EXTERNAL_REFERRALS, i.e. it does not
+         * chase the subordinate continuation references an AD DC returns for a subtree
+         * search of a domain NC.  libldap defaults LDAP_OPT_REFERRALS on and does chase
+         * them (anon rebind + re-search), which a Samba AD DC resets -> LDAP_SERVER_DOWN
+         * bubbles up out of an otherwise-successful (paged) search.  Match Windows. */
+        ldap_set_option( CTX(ld), LDAP_OPT_REFERRALS, LDAP_OPT_OFF );
         return ld;
     }
     free( ld );
