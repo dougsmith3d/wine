@@ -83,42 +83,76 @@ static RTL_CRITICAL_SECTION_DEBUG dynamic_unwind_debug =
 static RTL_CRITICAL_SECTION dynamic_unwind_section = { &dynamic_unwind_debug, -1, 0, 0, 0, 0 };
 
 
+/* Upper bound on dynamic-table entries whose [base,end) can overlap one PC. In practice the CLR
+ * creates at most a handful (a broad code-heap callback plus a few JIT sub-range tables); 16 is a
+ * generous cap that keeps the snapshot on the stack. */
+#define MAX_OVERLAP_ENTRIES 16
+
 static RUNTIME_FUNCTION *lookup_dynamic_function_table( ULONG_PTR pc, ULONG_PTR *base, ULONG *count,
                                                         struct dynamic_unwind_entry **pin )
 {
-    struct dynamic_unwind_entry *entry;
+    struct dynamic_unwind_entry *entry, *cand[MAX_OVERLAP_ENTRIES];
     RUNTIME_FUNCTION *ret = NULL;
+    unsigned int i, n = 0, used = ~0u;
 
+    /* A callback table (RtlInstallFunctionTableCallback) advertises a broad PC range but resolves
+     * each address lazily; it legitimately declines (returns NULL) for a PC that falls inside its
+     * [base,end) yet is actually owned by a *different*, overlapping dynamic table. The .NET CLR
+     * does exactly this: it registers a callback over a whole code-heap reservation while individual
+     * JIT sub-ranges are served by other tables. So the range match must keep scanning on a NULL
+     * return, and the callback must be invoked in list order.
+     *
+     * Critically, the callback (the CLR's GetRuntimeFunctionCallback) must run WITHOUT the global
+     * dynamic_unwind_section held. Disassembly of a real Windows ntdll shows RtlpLookupDynamic
+     * FunctionEntry takes its table lock only to find + reference the descriptor, RELEASES the lock,
+     * and invokes the callback afterwards. Wine used to call the callback while still holding
+     * dynamic_unwind_section, which inverts lock order against the CLR's own execution-manager lock:
+     * a JIT/GC thread that holds that lock and then registers a table via RtlAddGrowableFunctionTable
+     * blocks on dynamic_unwind_section, while our thread, inside the callback under that same lock,
+     * waits on the CLR lock. Under load the callback then stalls or declines (returns NULL), leaving
+     * a managed frame with a NULL RUNTIME_FUNCTION -> NULL funclet PC (the call *rsi=0 crash) and, at
+     * the same time, the "requests block" hang. Snapshot and reference every matching entry under the
+     * lock, drop the lock, then resolve (invoke callbacks / read tables) outside it. */
     *pin = NULL;
     RtlEnterCriticalSection( &dynamic_unwind_section );
     LIST_FOR_EACH_ENTRY( entry, &dynamic_unwind_list, struct dynamic_unwind_entry, entry )
     {
-        if (pc >= entry->base && pc < entry->end)
-        {
-            *base = entry->base;
-            if (entry->callback)
-            {
-                ret = entry->callback( pc, entry->context );
-                *count = 1;
-                if (!ret)
-                    ERR( "PALATE-A callback NULL pc=%p base=%Ix end=%Ix cb=%p\n",
-                         (void *)pc, entry->base, entry->end, entry->callback );
-            }
-            else
-            {
-                ret = entry->table;
-                *count = entry->count;
-                /* Pin the table for the caller's find_function_info() scan: while active is
-                 * non-zero a concurrent RtlDelete[Growable]FunctionTable will not return (and
-                 * hence the owner will not free the table) until we drop the reference. This
-                 * closes the Wine-only window where the scan reads a table the owner freed. */
-                entry->active++;
-                *pin = entry;
-            }
-            break;
-        }
+        if (pc < entry->base || pc >= entry->end) continue;
+        if (n == MAX_OVERLAP_ENTRIES) break;
+        /* Reference the entry so it (and, for a callback, its context) survives the unlocked
+         * resolution below: while active is non-zero a concurrent RtlDelete[Growable]FunctionTable
+         * will not return (and the owner will not free the table) until we drop the reference. */
+        entry->active++;
+        cand[n++] = entry;
+        /* A plain table always resolves; nothing later can override it, so stop collecting. */
+        if (!entry->callback) break;
     }
     RtlLeaveCriticalSection( &dynamic_unwind_section );
+
+    for (i = 0; i < n && !ret; i++)
+    {
+        entry = cand[i];
+        if (entry->callback)
+        {
+            if ((ret = entry->callback( pc, entry->context )))
+            {
+                *base = entry->base;
+                *count = 1;
+            }
+        }
+        else
+        {
+            *base = entry->base;
+            ret = entry->table;
+            *count = entry->count;
+            used = i;   /* hand this table's reference to the caller as *pin */
+        }
+    }
+
+    /* Drop every reference except the table entry handed back to the caller. */
+    for (i = 0; i < n; i++)
+        if (i != used) InterlockedDecrement( &cand[i]->active );
+    if (used != ~0u) *pin = cand[used];
     return ret;
 }
 
@@ -133,13 +167,9 @@ static void release_dynamic_function_table( struct dynamic_unwind_entry *entry )
  * reading its table to drain before the caller frees it (Windows rundown semantics). */
 static void drain_dynamic_function_table( struct dynamic_unwind_entry *entry )
 {
-    if (InterlockedCompareExchange( &entry->active, 0, 0 ))
-    {
-        ERR( "rundown: dynamic function table %p [%Ix-%Ix) freed while an unwind lookup is still "
-             "reading it (%ld active) -- use-after-free race caught\n",
-             entry->table, entry->base, entry->end, entry->active );
-        while (InterlockedCompareExchange( &entry->active, 0, 0 )) YieldProcessor();
-    }
+    /* This is the normal rundown wait, not an error: a concurrent lookup legitimately holds a
+     * reference across the (now unlocked) callback/table resolution. Spin until it drops. */
+    while (InterlockedCompareExchange( &entry->active, 0, 0 )) YieldProcessor();
 }
 
 
@@ -2356,9 +2386,6 @@ static RUNTIME_FUNCTION *raw_lookup_function_entry( ULONG_PTR pc, ULONG_PTR *bas
     if ((func = lookup_dynamic_function_table( pc, &dynbase, &size, &pin )))
     {
         RUNTIME_FUNCTION *ret = find_function_info( pc, dynbase, func, size );
-        if (!pin && !ret)
-            ERR( "PALATE-B callback RF rejected pc=%p dynbase=%Ix rf=%p begin=%x end=%x udata=%x\n",
-                 (void *)pc, dynbase, func, func->BeginAddress, func->EndAddress, func->UnwindData );
         if (ret) *base = dynbase;
         if (pin) release_dynamic_function_table( pin );
         return ret;
@@ -2382,6 +2409,17 @@ static RUNTIME_FUNCTION *raw_lookup_function_entry( ULONG_PTR pc, ULONG_PTR *bas
  * every cache hit also called that callback an EXTRA time, clobbering the scratch a concurrent unwind
  * was mid-read -- an actively perturbing measurement. Reverted to the stock behaviour (ignore the
  * caller's history table, resolve uncached each time) so measurements are uncontaminated.
+ *
+ * A second experiment re-added the caching, claiming the callback pointer was "stable per pc". It is
+ * NOT: for a dynamic (JIT/callback) entry raw_lookup_function_entry drops its table pin before it
+ * returns, so the resolved RUNTIME_FUNCTION is unreferenced and the CLR may free or overwrite it at
+ * any time. The caller's UNWIND_HISTORY_TABLE, however, lives for the WHOLE exception dispatch and is
+ * consulted again on later frames -- so a subsequent lookup dereferences that freed pointer
+ * (func->BeginAddress) and takes a c0000005. MEASURED: SharePoint's SPRequest.GetListItemDataWithCallback2
+ * render path faults exactly here (ntdll RtlLookupFunctionEntry +0x38), which the native COM boundary
+ * surfaces to managed code as DISP_E_EXCEPTION and turns a team-site page into a "Sorry, something went
+ * wrong" error page; the golden Windows farm renders the same page with zero AVs. Stay with the stock
+ * uncached behaviour.
  */
 PRUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *base,
                                                  UNWIND_HISTORY_TABLE *table )

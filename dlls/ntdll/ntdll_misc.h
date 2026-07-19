@@ -34,6 +34,7 @@
 #define MAX_NT_PATH_LENGTH 277
 
 #define NTDLL_TLS_ERRNO 16  /* TLS slot for _errno() */
+#define NTDLL_TLS_UNWIND_SCRATCH 17  /* TLS slot: per-thread stable copies of callback RUNTIME_FUNCTIONs */
 
 #define NTDLL_ACTCTX_STACK_FRAME_HEAP_ALLOCATED 0x8 /* RTL_ACTIVATION_CONTEXT_STACK_FRAME.Flags */
 

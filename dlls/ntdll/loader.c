@@ -1493,22 +1493,84 @@ static NTSTATUS fixup_imports_ilonly( WINE_MODREF *wm, LPCWSTR load_path, void *
 
 
 /****************************************************************
- *       import_target_in_progress
+ *       find_import_modref
  *
- * Return whether the dependency named by an import descriptor is itself still
- * being snapped (a circular-import edge).  Used to break the snapping recursion
- * on a re-entrant fixup_imports without loading anything.
- * The loader_section must be locked while calling this function.
+ * Return the already-loaded modref named by an import descriptor, or NULL if
+ * it is not loaded.  The loader_section must be locked while calling this.
  */
-static BOOL import_target_in_progress( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr )
+static WINE_MODREF *find_import_modref( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr )
 {
     WCHAR buffer[256];
-    WINE_MODREF *imp;
     const char *name = get_rva( wm->ldr.DllBase, descr->Name );
 
-    if (build_import_name( wm, buffer, name, strlen(name) )) return FALSE;
-    if (!(imp = find_basename_module( buffer ))) return FALSE;
-    return (imp->ldr.Flags & LDR_LOAD_IN_PROGRESS) != 0;
+    if (build_import_name( wm, buffer, name, strlen(name) )) return NULL;
+    return find_basename_module( buffer );
+}
+
+
+/****************************************************************
+ *       snap_module_thunks
+ *
+ * Bind wm's import thunks for a single descriptor against an already-mapped
+ * dependency, WITHOUT loading or (re-)snapping that dependency.  Used on a
+ * re-entrant (cyclic) fixup for an edge whose target is itself still being
+ * snapped: the target is already mapped, so its exports are available, and
+ * binding this module's own thunks now - rather than skipping the edge and
+ * relying on a later outer pass - closes the window in which this module's
+ * address escapes through the cycle (e.g. combase!CoCreateGuid handed to
+ * ole32 / cached by the CLR's P/Invoke) while one of its thunks
+ * (rpcrt4!UuidCreate) is still the raw import-by-name RVA.  Executing that raw
+ * thunk jumps to the low RVA and faults on execute (the SharePoint perfmon
+ * timer thread's Guid.NewGuid -> CoCreateGuid -> UuidCreate crash).  Only the
+ * recursive LOAD is unsafe on a live cycle edge; the thunk writes are not, so
+ * do them here.  The loader_section must be locked while calling this.
+ */
+static void snap_module_thunks( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr,
+                                WINE_MODREF *wmImp, LPCWSTR load_path )
+{
+    HMODULE module = wm->ldr.DllBase;
+    HMODULE imp_mod = wmImp->ldr.DllBase;
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    DWORD exp_size;
+    const IMAGE_THUNK_DATA *import_list;
+    IMAGE_THUNK_DATA *thunk_list;
+    PVOID protect_base;
+    SIZE_T protect_size = 0;
+    DWORD protect_old;
+
+    thunk_list = get_rva( module, (DWORD)descr->FirstThunk );
+    import_list = descr->OriginalFirstThunk ? get_rva( module, (DWORD)descr->OriginalFirstThunk )
+                                            : thunk_list;
+    if (!import_list->u1.Ordinal) return;
+    if (!(exports = RtlImageDirectoryEntryToData( imp_mod, TRUE,
+                                                  IMAGE_DIRECTORY_ENTRY_EXPORT, &exp_size ))) return;
+
+    /* unprotect the IAT (it can live in a read-only section) */
+    while (import_list[protect_size].u1.Ordinal) protect_size++;
+    protect_base = thunk_list;
+    protect_size *= sizeof(*thunk_list);
+    NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &protect_size,
+                            PAGE_READWRITE, &protect_old );
+
+    while (import_list->u1.Ordinal)
+    {
+        if (IMAGE_SNAP_BY_ORDINAL(import_list->u1.Ordinal))
+        {
+            int ordinal = IMAGE_ORDINAL(import_list->u1.Ordinal);
+            thunk_list->u1.Function = (ULONG_PTR)find_ordinal_export( imp_mod, exports, exp_size,
+                                                 ordinal - exports->Base, load_path, wm, FALSE );
+        }
+        else
+        {
+            IMAGE_IMPORT_BY_NAME *pe_name = get_rva( module, (DWORD)import_list->u1.AddressOfData );
+            thunk_list->u1.Function = (ULONG_PTR)find_named_export( imp_mod, exports, exp_size,
+                                                 (const char *)pe_name->Name, pe_name->Hint,
+                                                 load_path, wm, FALSE );
+        }
+        import_list++;
+        thunk_list++;
+    }
+    NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &protect_size, protect_old, &protect_old );
 }
 
 
@@ -1589,11 +1651,24 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
     status = STATUS_SUCCESS;
     for (i = 0; i < nb_imports; i++)
     {
-        /* On a re-entrant (cyclic) fixup, skip a dependency that is itself
-         * still being snapped - loading it would recurse forever - but snap
-         * everything else now so this module's own thunks get bound before its
-         * address is handed out through the cycle. */
-        if (reentrant && import_target_in_progress( wm, &imports[i] )) continue;
+        /* On a re-entrant (cyclic) fixup, a dependency that is itself still
+         * being snapped must not be LOADED again here - that would recurse
+         * forever.  But its exports are already available (it is mapped), so
+         * still bind THIS module's own thunks against it now, rather than
+         * skipping the edge: skipping leaves those thunks raw (the unbound
+         * import-by-name RVA) while this module's address escapes through the
+         * cycle, so a later call jumps through a raw thunk and faults on
+         * execute (combase!CoCreateGuid -> rpcrt4!UuidCreate).  Everything
+         * else is snapped normally below. */
+        if (reentrant)
+        {
+            WINE_MODREF *dep = find_import_modref( wm, &imports[i] );
+            if (dep && (dep->ldr.Flags & LDR_LOAD_IN_PROGRESS))
+            {
+                snap_module_thunks( wm, &imports[i], dep, load_path );
+                continue;
+            }
+        }
         dep_after = wm->ldr.DdagNode->Dependencies.Tail;
         if (!import_dll( wm, &imports[i], load_path, &imp ))
             status = STATUS_DLL_NOT_FOUND;
@@ -4792,6 +4867,13 @@ void loader_init( CONTEXT *context, void **entry )
         /* TLS index 0 is always reserved, and wow64 reserves extra TLS entries */
         RtlSetBits( peb->TlsBitmap, 0, NtCurrentTeb()->WowTebOffset ? WOW64_TLS_MAX_NUMBER : 1 );
         RtlSetBits( peb->TlsBitmap, NTDLL_TLS_ERRNO, 1 );
+        /* NTDLL_TLS_UNWIND_SCRATCH is a fixed TlsSlots[] index used internally by the unwinder
+         * (stabilize_callback_function_entry). It lives in the same TlsSlots[] array that TlsAlloc
+         * hands out from peb->TlsBitmap, so it MUST be reserved here or TlsAlloc will eventually
+         * give it to the application (the CLR/ASP.NET allocate >16 slots): the app then overwrites
+         * the unwinder's per-thread ring pointer with an arbitrary non-NULL value, and the next
+         * stackwalk dereferences it as a struct unwind_scratch_ring -> access violation. */
+        RtlSetBits( peb->TlsBitmap, NTDLL_TLS_UNWIND_SCRATCH, 1 );
 
         if (!(tls_dirs = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, tls_module_count * sizeof(*tls_dirs) )))
             NtTerminateProcess( GetCurrentProcess(), STATUS_NO_MEMORY );
