@@ -568,10 +568,19 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
             old.s = *u.s;
             new = old;
 
-            if (!old.s.exclusive_waiters)
+            if (!old.s.exclusive_waiters ||
+                (old.s.owners && !(old.s.exclusive_waiters & 1)))
             {
-                /* Not locked exclusive, and no exclusive waiters.
-                 * We can try to grab it. */
+                /* Either nobody is waiting to acquire the lock exclusive, or
+                 * the lock is currently held shared (and not exclusive) --
+                 * on Windows a shared acquire is allowed to barge a queued
+                 * exclusive waiter in that case instead of queueing behind
+                 * it. Without this, a thread that takes the lock shared
+                 * while a writer is already waiting can never be joined by
+                 * further readers; if one of those existing readers can only
+                 * make progress (and drop its shared hold) after another
+                 * shared acquire elsewhere succeeds, the whole set deadlocks
+                 * -- which does not happen on Windows. */
                 ++new.s.owners;
                 wait = FALSE;
             }

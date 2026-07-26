@@ -40,6 +40,9 @@
 #endif
 #include <sys/types.h>
 #include <sys/wait.h>
+#ifdef linux
+# include <sys/syscall.h>
+#endif
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
 #endif
@@ -1015,7 +1018,20 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
     unsigned long value;
 
     if (unix_pid == -1)
-        strcpy( path, "/proc/self/status" );
+    {
+        /* Query the calling thread's own /proc/<tid>/status instead of
+         * /proc/self/status. On Linux, /proc/self resolves to the thread-
+         * group leader (the tgid), not the calling thread. Wine's process
+         * bootstrap can leave the original leader thread as a permanent
+         * zombie once a cloned sibling takes over as the represented main
+         * thread; /proc/<tgid>/status for that zombie leader then reports
+         * State: Z with no VmSize/VmRSS/etc. fields at all, even though the
+         * calling thread and the whole process are alive and using real
+         * memory. Using the actual calling thread's tid avoids reading a
+         * dead task's status and getting bogus all-zero counters back.
+         */
+        snprintf( path, sizeof(path), "/proc/%u/status", (unsigned int)syscall( __NR_gettid ) );
+    }
     else
         snprintf( path, sizeof(path), "/proc/%u/status", unix_pid);
     f = fopen( path, "r" );

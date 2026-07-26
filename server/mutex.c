@@ -260,7 +260,6 @@ static int mutex_signal( struct object *obj, unsigned int access, int signal )
     struct mutex *mutex = (struct mutex *)obj;
     assert( obj->ops == &mutex_ops );
 
-    assert( mutex->sync->ops == &mutex_sync_ops ); /* never called with inproc syncs */
     assert( signal == -1 ); /* always called from signal_object */
 
     if (!(access & SYNCHRONIZE))
@@ -268,6 +267,8 @@ static int mutex_signal( struct object *obj, unsigned int access, int signal )
         set_error( STATUS_ACCESS_DENIED );
         return 0;
     }
+    if (mutex->sync->ops != &mutex_sync_ops)
+        return release_inproc_mutex( (struct inproc_sync *)mutex->sync, NULL );
     return do_release( (struct mutex_sync *)mutex->sync, current, 1 );
 }
 
@@ -319,11 +320,18 @@ DECL_HANDLER(release_mutex)
     if ((mutex = (struct mutex *)get_handle_obj( current->process, req->handle,
                                                  0, &mutex_ops )))
     {
-        struct mutex_sync *sync = (struct mutex_sync *)mutex->sync;
-        assert( mutex->sync->ops == &mutex_sync_ops ); /* never called with inproc syncs */
-
-        reply->prev_count = sync->count;
-        do_release( sync, current, 1 );
+        if (mutex->sync->ops != &mutex_sync_ops)
+        {
+            unsigned int prev_count = 0;
+            if (release_inproc_mutex( (struct inproc_sync *)mutex->sync, &prev_count ))
+                reply->prev_count = prev_count;
+        }
+        else
+        {
+            struct mutex_sync *sync = (struct mutex_sync *)mutex->sync;
+            reply->prev_count = sync->count;
+            do_release( sync, current, 1 );
+        }
         release_object( mutex );
     }
 }
@@ -336,12 +344,23 @@ DECL_HANDLER(query_mutex)
     if ((mutex = (struct mutex *)get_handle_obj( current->process, req->handle,
                                                  MUTANT_QUERY_STATE, &mutex_ops )))
     {
-        struct mutex_sync *sync = (struct mutex_sync *)mutex->sync;
-        assert( mutex->sync->ops == &mutex_sync_ops ); /* never called with inproc syncs */
+        if (mutex->sync->ops != &mutex_sync_ops)
+        {
+            unsigned int count;
+            int owned, abandoned;
 
-        reply->count = sync->count;
-        reply->owned = (sync->owner == current);
-        reply->abandoned = sync->abandoned;
+            query_inproc_mutex( (struct inproc_sync *)mutex->sync, &count, &owned, &abandoned );
+            reply->count = count;
+            reply->owned = owned;
+            reply->abandoned = abandoned;
+        }
+        else
+        {
+            struct mutex_sync *sync = (struct mutex_sync *)mutex->sync;
+            reply->count = sync->count;
+            reply->owned = (sync->owner == current);
+            reply->abandoned = sync->abandoned;
+        }
 
         release_object( mutex );
     }

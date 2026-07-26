@@ -1223,7 +1223,12 @@ DECL_HANDLER(new_process)
     info->process  = NULL;
     info->data     = NULL;
 
-    if (!(info->sync = create_internal_sync( 1, 0 )))
+    /* this sync is waited on by the creating process via the generic server_select()
+     * path (see NtWaitForSingleObject() on the "info" handle in ntdll's create-process
+     * code), not through a client-side fast-sync-aware handle type, so it must stay a
+     * classic queue-based sync object rather than an ntsync-backed one (whose add_queue
+     * is a no-op) -- same reasoning as send_debug_event's use of create_server_internal_sync. */
+    if (!(info->sync = (struct object *)create_server_internal_sync( 1, 0 )))
     {
         close( socket_fd );
         goto done;

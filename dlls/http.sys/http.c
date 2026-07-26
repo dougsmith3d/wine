@@ -1055,6 +1055,12 @@ static NTSTATUS http_send_response(struct request_queue *queue, IRP *irp)
 
                 conn->queue = NULL;
                 conn->req_id = HTTP_NULL_ID;
+                /* The request we just responded to is no longer available; otherwise
+                 * receive_data() will refuse to parse the next request on this
+                 * keep-alive connection (it bails out while conn->available is still
+                 * set from the previous request), and the data it read from the
+                 * socket is silently stranded in conn->buffer forever. */
+                conn->available = FALSE;
                 WSAEventSelect(conn->socket, request_event, FD_READ | FD_CLOSE);
 
                 /* We might have another request already in the buffer. */

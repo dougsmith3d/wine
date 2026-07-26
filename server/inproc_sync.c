@@ -40,6 +40,7 @@
 
 #ifdef NTSYNC_IOC_EVENT_READ
 
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -47,10 +48,9 @@
 
 int get_inproc_device_fd(void)
 {
-    /* SharePoint-under-Wine: disable in-proc (ntsync) syncs - this tree has a bug where the server
-     * release_mutex is called for an inproc mutex (asserts). Force out-of-proc syncs (like older Wine).
-     * TODO upstream: fix the inproc mutex release path instead. */
-    return -1;
+    static int fd = -2;
+    if (fd == -2) fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );
+    return fd;
 }
 
 struct inproc_sync
@@ -195,6 +195,40 @@ void reset_inproc_sync( struct inproc_sync *sync )
     ioctl( sync->fd, NTSYNC_IOC_EVENT_RESET, &count );
 }
 
+/* release an inproc (ntsync-backed) mutex on behalf of the current thread */
+int release_inproc_mutex( struct inproc_sync *sync, unsigned int *prev_count )
+{
+    struct ntsync_mutex_args args = {.owner = current->id};
+
+    if (ioctl( sync->fd, NTSYNC_IOC_MUTEX_UNLOCK, &args ) == -1)
+    {
+        if (errno == EPERM) set_error( STATUS_MUTANT_NOT_OWNED );
+        else if (errno == EOVERFLOW) set_error( STATUS_MUTANT_LIMIT_EXCEEDED );
+        else set_error( STATUS_UNSUCCESSFUL );
+        return 0;
+    }
+    if (prev_count) *prev_count = 1 - args.count;
+    return 1;
+}
+
+/* query the state of an inproc (ntsync-backed) mutex */
+void query_inproc_mutex( struct inproc_sync *sync, unsigned int *count, int *owned, int *abandoned )
+{
+    struct ntsync_mutex_args args = {0};
+
+    if (ioctl( sync->fd, NTSYNC_IOC_MUTEX_READ, &args ) == -1)
+    {
+        /* EOWNERDEAD: the owning thread died without releasing it */
+        *abandoned = 1;
+        *owned = 0;
+        *count = 1;
+        return;
+    }
+    *abandoned = 0;
+    *owned = (args.owner == current->id);
+    *count = 1 - args.count;
+}
+
 static int inproc_sync_signal( struct object *obj, unsigned int access, int signal )
 {
     struct inproc_sync *sync = (struct inproc_sync *)obj;
@@ -278,6 +312,15 @@ void signal_inproc_sync( struct inproc_sync *sync )
 }
 
 void reset_inproc_sync( struct inproc_sync *sync )
+{
+}
+
+int release_inproc_mutex( struct inproc_sync *sync, unsigned int *prev_count )
+{
+    return 0;
+}
+
+void query_inproc_mutex( struct inproc_sync *sync, unsigned int *count, int *owned, int *abandoned )
 {
 }
 
