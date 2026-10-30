@@ -1855,6 +1855,11 @@ static DWORD xrenderdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
 
         pXRenderFreePicture( gdi_display, src_pict );
         XFreePixmap( gdi_display, src_pixmap );
+
+        /* The final composite is a small request that would otherwise sit in the
+         * Xlib output buffer until some unrelated request flushes it, delaying the
+         * presentation of software-rendered frames. */
+        XFlush( gdi_display );
     }
     return ret;
 
